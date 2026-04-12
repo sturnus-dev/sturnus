@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
     for (alias, candidates) in &config.model {
         rr_state.register_alias(alias.clone());
         for c in candidates {
-            tracker_inner.register((c.provider.clone(), c.model.clone()));
+            tracker_inner.register((Arc::from(c.provider.as_str()), Arc::from(c.model.as_str())));
         }
     }
 
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     let max_body_bytes = config.routing.max_body_bytes;
 
     let metrics = Metrics::new();
-    let label_triples: Vec<_> = model_map
+    let label_triples: Vec<(&str, &str, &str)> = model_map
         .alias_names()
         .iter()
         .flat_map(|alias| {
@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(alias)
                 .unwrap_or_default()
                 .iter()
-                .map(|c| (alias.to_string(), c.provider_name.clone(), c.model.clone()))
+                .map(|c| (*alias, &*c.provider_name, &*c.model))
         })
         .collect();
     metrics.init_zero(&label_triples);

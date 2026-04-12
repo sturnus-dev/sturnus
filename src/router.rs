@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 
 /// Separate route/explore counters per alias to avoid counter drift when
 /// explore picks consume ticks.
+#[derive(Debug)]
 pub struct RoundRobinState {
     route_counters: std::collections::HashMap<String, std::sync::atomic::AtomicUsize>,
     explore_counters: std::collections::HashMap<String, std::sync::atomic::AtomicUsize>,
@@ -125,16 +126,21 @@ pub fn candidate_key(c: &ResolvedCandidate) -> CandidateKey {
 mod tests {
     use super::*;
     use crate::tracker::Tracker;
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn make_candidate(provider: &str, model: &str) -> ResolvedCandidate {
         ResolvedCandidate {
-            provider_name: provider.to_string(),
-            model: model.to_string(),
+            provider_name: Arc::from(provider),
+            model: Arc::from(model),
             base_url: "http://localhost".to_string(),
             api_key: None,
             kind: crate::model_map::ProviderKind::ApiKey,
         }
+    }
+
+    fn key(provider: &str, model: &str) -> CandidateKey {
+        (Arc::from(provider), Arc::from(model))
     }
 
     fn setup(candidates: &[ResolvedCandidate]) -> (Tracker, RoundRobinState) {
@@ -169,14 +175,14 @@ mod tests {
         let candidates = vec![make_candidate("slow", "m1"), make_candidate("fast", "m2")];
         let (tracker, rr) = setup(&candidates);
 
-        let slow_key = ("slow".to_string(), "m1".to_string());
-        let fast_key = ("fast".to_string(), "m2".to_string());
+        let slow_key = key("slow", "m1");
+        let fast_key = key("fast", "m2");
         tracker.record_ttfc(&slow_key, Duration::from_millis(500));
         tracker.record_ttfc(&fast_key, Duration::from_millis(100));
 
         for _ in 0..10 {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-            assert_eq!(picked.provider_name, "fast");
+            assert_eq!(&*picked.provider_name, "fast");
         }
     }
 
@@ -185,8 +191,8 @@ mod tests {
         let candidates = vec![make_candidate("good", "m1"), make_candidate("bad", "m2")];
         let (tracker, rr) = setup(&candidates);
 
-        let good_key = ("good".to_string(), "m1".to_string());
-        let bad_key = ("bad".to_string(), "m2".to_string());
+        let good_key = key("good", "m1");
+        let bad_key = key("bad", "m2");
 
         tracker.record_ttfc(&good_key, Duration::from_millis(200));
         tracker.record_ttfc(&bad_key, Duration::from_millis(50));
@@ -198,7 +204,7 @@ mod tests {
 
         for _ in 0..20 {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
-            assert_eq!(picked.provider_name, "good");
+            assert_eq!(&*picked.provider_name, "good");
         }
     }
 
@@ -207,7 +213,7 @@ mod tests {
         let candidates = vec![make_candidate("warm", "m1"), make_candidate("cold", "m2")];
         let (tracker, rr) = setup(&candidates);
 
-        let warm_key = ("warm".to_string(), "m1".to_string());
+        let warm_key = key("warm", "m1");
         tracker.record_ttfc(&warm_key, Duration::from_millis(100));
 
         // With explore_ratio=0.5, roughly half should go to the cold candidate
@@ -215,7 +221,7 @@ mod tests {
         let n = 100;
         for _ in 0..n {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.5).unwrap();
-            if picked.provider_name == "cold" {
+            if &*picked.provider_name == "cold" {
                 cold_picks += 1;
             }
         }
@@ -234,21 +240,21 @@ mod tests {
         let candidates = vec![make_candidate("a", "m1"), make_candidate("b", "m2")];
         let (tracker, rr) = setup(&candidates);
 
-        let ka = ("a".to_string(), "m1".to_string());
-        let kb = ("b".to_string(), "m2".to_string());
+        let ka = key("a", "m1");
+        let kb = key("b", "m2");
 
         tracker.record_ttfc(&ka, Duration::from_millis(100));
         tracker.record_ttfc(&kb, Duration::from_millis(300));
 
         let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-        assert_eq!(picked.provider_name, "a");
+        assert_eq!(&*picked.provider_name, "a");
 
         for _ in 0..20 {
             tracker.record_ttfc(&ka, Duration::from_millis(500));
         }
 
         let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-        assert_eq!(picked.provider_name, "b");
+        assert_eq!(&*picked.provider_name, "b");
     }
 
     #[test]
@@ -256,8 +262,8 @@ mod tests {
         let candidates = vec![make_candidate("good", "m1"), make_candidate("bad", "m2")];
         let (tracker, rr) = setup(&candidates);
 
-        let good_key = ("good".to_string(), "m1".to_string());
-        let bad_key = ("bad".to_string(), "m2".to_string());
+        let good_key = key("good", "m1");
+        let bad_key = key("bad", "m2");
 
         tracker.record_ttfc(&good_key, Duration::from_millis(100));
 
@@ -271,7 +277,7 @@ mod tests {
 
         for _ in 0..20 {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.5).unwrap();
-            assert_eq!(picked.provider_name, "good");
+            assert_eq!(&*picked.provider_name, "good");
         }
     }
 }

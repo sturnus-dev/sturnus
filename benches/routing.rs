@@ -1,4 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::sync::Arc;
 use std::time::Duration;
 
 use llmrouter::model_map::{ProviderKind, ResolvedCandidate};
@@ -8,8 +9,8 @@ use llmrouter::tracker::Tracker;
 
 fn make_candidate(provider: &str, model: &str) -> ResolvedCandidate {
     ResolvedCandidate {
-        provider_name: provider.to_string(),
-        model: model.to_string(),
+        provider_name: Arc::from(provider),
+        model: Arc::from(model),
         base_url: "http://localhost".to_string(),
         api_key: None,
         kind: ProviderKind::ApiKey,

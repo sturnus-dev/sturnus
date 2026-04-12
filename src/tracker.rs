@@ -3,11 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Key: (provider_name, model_name)
-pub type CandidateKey = (String, String);
+/// Key: (provider_name, model_name). Uses `Arc<str>` so cloning is a
+/// cheap reference-count bump instead of a heap allocation.
+pub type CandidateKey = (Arc<str>, Arc<str>);
 
 /// Time-windowed sliding buffer of request outcomes. Entries older than
 /// `window` are pruned on access, so errors age out naturally.
+#[derive(Debug)]
 struct ErrorWindow {
     outcomes: VecDeque<(Instant, bool)>,
     window: Duration,
@@ -53,6 +55,7 @@ impl ErrorWindow {
     }
 }
 
+#[derive(Debug)]
 pub struct CandidateStats {
     /// EWMA of TTFC in milliseconds. u64::MAX = cold (no data).
     pub ewma_ms: AtomicU64,
@@ -120,12 +123,13 @@ impl CandidateStats {
     }
 }
 
+#[derive(Debug)]
 pub struct Tracker {
-    pub stats: HashMap<CandidateKey, Arc<CandidateStats>>,
-    pub alpha: f64,
-    pub error_window_duration: Duration,
-    pub error_threshold: f64,
-    pub max_error_window_entries: usize,
+    pub(crate) stats: HashMap<CandidateKey, Arc<CandidateStats>>,
+    alpha: f64,
+    error_window_duration: Duration,
+    error_threshold: f64,
+    max_error_window_entries: usize,
 }
 
 impl Tracker {
@@ -188,7 +192,7 @@ mod tests {
     use super::*;
 
     fn key(provider: &str, model: &str) -> CandidateKey {
-        (provider.to_string(), model.to_string())
+        (Arc::from(provider), Arc::from(model))
     }
 
     #[test]

@@ -9,6 +9,12 @@ pub struct Metrics {
     pub errors_total: IntCounterVec,
 }
 
+impl std::fmt::Debug for Metrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Metrics").finish_non_exhaustive()
+    }
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
@@ -63,8 +69,8 @@ impl Metrics {
     }
 
     /// Zero-init error counters so a missing series isn't mistaken for "no errors".
-    pub fn init_zero(&self, aliases: &[(String, String, String)]) {
-        for (alias, provider, model) in aliases {
+    pub fn init_zero(&self, aliases: &[(&str, &str, &str)]) {
+        for &(alias, provider, model) in aliases {
             self.errors_total
                 .with_label_values(&[alias, provider, model]);
         }

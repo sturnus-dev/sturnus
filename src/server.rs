@@ -18,7 +18,7 @@ use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
 use crate::proxy;
 use crate::router::{self, candidate_key, RoundRobinState};
-use crate::tracker::Tracker;
+use crate::tracker::{CandidateKey, Tracker};
 
 pub struct AppState {
     pub model_map: ModelMap,
@@ -46,14 +46,14 @@ fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
             "type": "invalid_request_error",
         }
     });
-    let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+    let bytes = Bytes::from(serde_json::to_vec(&body).expect("serialize static JSON value"));
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(http_body_util::Either::Left(http_body_util::Full::new(
             bytes,
         )))
-        .unwrap()
+        .expect("build error response")
 }
 
 pub async fn handle_request(
@@ -88,7 +88,7 @@ pub async fn handle_request(
                         .body(http_body_util::Either::Left(http_body_util::Full::new(
                             body,
                         )))
-                        .unwrap();
+                        .expect("build metrics response");
                     Ok(resp)
                 }
                 Err(e) => {
@@ -110,13 +110,13 @@ pub async fn handle_request(
         ));
     }
 
-    let affinity = req
+    let affinity: Option<CandidateKey> = req
         .headers()
         .get("x-session-affinity")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             let (provider, model) = v.split_once('/')?;
-            Some((provider.to_string(), model.to_string()))
+            Some((Arc::from(provider), Arc::from(model)))
         });
 
     let max_body = state.max_body_bytes;
@@ -208,6 +208,9 @@ pub async fn handle_request(
     )
     .await;
 
+    let provider: &str = &candidate.provider_name;
+    let model: &str = &candidate.model;
+
     match result {
         Ok(proxy_result) => {
             state.tracker.record_ttfc(&key, proxy_result.ttfc);
@@ -222,22 +225,17 @@ pub async fn handle_request(
             state
                 .metrics
                 .requests_total
-                .with_label_values(&[
-                    &alias,
-                    &candidate.provider_name,
-                    &candidate.model,
-                    &status_str,
-                ])
+                .with_label_values(&[alias.as_str(), provider, model, status_str.as_str()])
                 .inc();
             state
                 .metrics
                 .ttfc_seconds
-                .with_label_values(&[&alias, &candidate.provider_name, &candidate.model])
+                .with_label_values(&[alias.as_str(), provider, model])
                 .observe(proxy_result.ttfc.as_secs_f64());
 
             debug!(
-                provider = %candidate.provider_name,
-                model = %candidate.model,
+                provider = %provider,
+                model = %model,
                 status = %proxy_result.status,
                 ttfc_ms = proxy_result.ttfc.as_millis(),
                 "response received"
@@ -247,19 +245,16 @@ pub async fn handle_request(
             for (k, v) in &proxy_result.headers {
                 builder = builder.header(k, v);
             }
-            builder = builder.header("x-llmrouter-provider", &candidate.provider_name);
-            builder = builder.header(
-                "x-session-affinity",
-                format!("{}/{}", candidate.provider_name, candidate.model),
-            );
+            builder = builder.header("x-llmrouter-provider", provider);
+            builder = builder.header("x-session-affinity", format!("{provider}/{model}"));
 
             let body = proxy::into_hyper_body(proxy_result.body);
-            Ok(builder.body(body).unwrap())
+            Ok(builder.body(body).expect("build proxy response"))
         }
         Err(e) => {
             warn!(
-                provider = %candidate.provider_name,
-                model = %candidate.model,
+                provider = %provider,
+                model = %model,
                 error = %e,
                 "upstream request failed"
             );
@@ -268,7 +263,7 @@ pub async fn handle_request(
             state
                 .metrics
                 .errors_total
-                .with_label_values(&[&alias, &candidate.provider_name, &candidate.model])
+                .with_label_values(&[alias.as_str(), provider, model])
                 .inc();
 
             Ok(json_error(
@@ -286,7 +281,7 @@ fn json_response(status: u16, body: Bytes) -> Response<BoxBody> {
         .body(http_body_util::Either::Left(http_body_util::Full::new(
             body,
         )))
-        .unwrap()
+        .expect("build JSON response")
 }
 
 pub async fn run_server(
@@ -363,8 +358,8 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
         };
 
         candidates.push(serde_json::json!({
-            "provider": key.0,
-            "model": key.1,
+            "provider": &*key.0,
+            "model": &*key.1,
             "status": status,
             "ewma_ms": if ewma == u64::MAX { None } else { Some(ewma) },
             "error_rate": stats.error_rate(),
@@ -374,7 +369,7 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
     let body = serde_json::json!({
         "candidates": candidates,
     });
-    let bytes = Bytes::from(serde_json::to_vec_pretty(&body).unwrap());
+    let bytes = Bytes::from(serde_json::to_vec_pretty(&body).expect("serialize status JSON"));
     json_response(200, bytes)
 }
 
@@ -406,7 +401,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
         for (alias, candidates) in &config.model {
             rr_state.register_alias(alias.clone());
             for c in candidates {
-                tracker.register((c.provider.clone(), c.model.clone()));
+                tracker.register((Arc::from(c.provider.as_str()), Arc::from(c.model.as_str())));
             }
         }
 
@@ -780,15 +775,15 @@ fast = [
         for (alias, candidates) in &config.model {
             rr_state.register_alias(alias.clone());
             for c in candidates {
-                tracker.register((c.provider.clone(), c.model.clone()));
+                tracker.register((Arc::from(c.provider.as_str()), Arc::from(c.model.as_str())));
             }
         }
 
         // Make beta look fast (10ms) and alpha slow (500ms) so the router
         // naturally prefers beta. We then pin affinity to alpha and verify
         // the router honours the pin instead of picking beta.
-        let alpha_key = ("alpha".to_string(), "test-model".to_string());
-        let beta_key = ("beta".to_string(), "test-model".to_string());
+        let alpha_key: CandidateKey = (Arc::from("alpha"), Arc::from("test-model"));
+        let beta_key: CandidateKey = (Arc::from("beta"), Arc::from("test-model"));
         tracker.record_ttfc(&alpha_key, Duration::from_millis(500));
         tracker.record_success(&alpha_key);
         tracker.record_ttfc(&beta_key, Duration::from_millis(10));

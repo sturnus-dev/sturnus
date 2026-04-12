@@ -6,7 +6,7 @@ authors = ["Danny Boland <danny@boland.dev>"]
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync", "io-util"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
 http-body-util = "0.1"
