@@ -5,6 +5,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::graceful::GracefulShutdown;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +18,8 @@ use crate::gcp_auth::GcpTokenProvider;
 use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
 use crate::proxy;
-use crate::router::{self, candidate_key, RoundRobinState};
-use crate::tracker::{CandidateKey, Tracker};
+use crate::router::{self, RoundRobinState};
+use crate::tracker::Tracker;
 
 pub struct AppState {
     pub model_map: ModelMap,
@@ -26,7 +27,7 @@ pub struct AppState {
     pub rr_state: RoundRobinState,
     pub client: reqwest::Client,
     pub explore_ratio: f64,
-    pub gcp_token_provider: Option<Arc<GcpTokenProvider>>,
+    pub gcp_token_provider: Option<GcpTokenProvider>,
     pub max_body_bytes: usize,
     pub metrics: Metrics,
     pub shutting_down: AtomicBool,
@@ -57,7 +58,7 @@ fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
 }
 
 pub async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<BoxBody>, Infallible> {
     let path = req.uri().path().to_string();
@@ -110,14 +111,7 @@ pub async fn handle_request(
         ));
     }
 
-    let affinity: Option<CandidateKey> = req
-        .headers()
-        .get("x-session-affinity")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (provider, model) = v.split_once('/')?;
-            Some((Arc::from(provider), Arc::from(model)))
-        });
+    let affinity_header = req.headers_mut().remove("x-session-affinity");
 
     let max_body = state.max_body_bytes;
     let body_bytes = match Limited::new(req, max_body).collect().await {
@@ -155,10 +149,16 @@ pub async fn handle_request(
         }
     };
 
-    let pinned = affinity.as_ref().and_then(|(provider, model)| {
-        let key = (provider.clone(), model.clone());
-        let found = candidates.iter().find(|c| candidate_key(c) == key)?;
-        if state.tracker.is_degraded(&key) {
+    let affinity: Option<(&str, &str)> = affinity_header
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|string| string.split_once('/'));
+
+    let pinned = affinity.and_then(|(provider, model)| {
+        let found = candidates
+            .iter()
+            .find(|c| c.provider_name == provider && c.model == model)?;
+        if state.tracker.is_degraded(found.stats_index) {
             debug!(provider = %provider, model = %model, "affinity provider degraded, re-routing");
             None
         } else {
@@ -186,7 +186,7 @@ pub async fn handle_request(
         }
     };
 
-    let key = candidate_key(candidate);
+    let stats_index = candidate.stats_index;
 
     let is_streaming = proxy::extract_json_bool(&body_bytes, "stream").unwrap_or(false);
 
@@ -213,12 +213,12 @@ pub async fn handle_request(
 
     match result {
         Ok(proxy_result) => {
-            state.tracker.record_ttfc(&key, proxy_result.ttfc);
+            state.tracker.record_ttfc(stats_index, proxy_result.ttfc);
 
             if proxy_result.status.is_success() {
-                state.tracker.record_success(&key);
+                state.tracker.record_success(stats_index);
             } else {
-                state.tracker.record_error(&key);
+                state.tracker.record_error(stats_index);
             }
 
             let status_str = proxy_result.status.as_u16().to_string();
@@ -259,7 +259,7 @@ pub async fn handle_request(
                 "upstream request failed"
             );
 
-            state.tracker.record_error(&key);
+            state.tracker.record_error(stats_index);
             state
                 .metrics
                 .errors_total
@@ -345,10 +345,15 @@ pub async fn run_server(
 
 fn build_status_response(state: &AppState) -> Response<BoxBody> {
     let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
 
-    for (key, stats) in &state.tracker.stats {
+    for (_alias, c) in state.model_map.iter() {
+        if !seen.insert(c.stats_index) {
+            continue;
+        }
+        let stats = state.tracker.stats(c.stats_index);
         let ewma = stats.ewma_ms.load(Ordering::Relaxed);
-        let degraded = state.tracker.is_degraded(key);
+        let degraded = state.tracker.is_degraded(c.stats_index);
         let status = if ewma == u64::MAX {
             "cold"
         } else if degraded {
@@ -358,8 +363,8 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
         };
 
         candidates.push(serde_json::json!({
-            "provider": &*key.0,
-            "model": &*key.1,
+            "provider": c.provider_name,
+            "model": c.model,
             "status": status,
             "ewma_ms": if ewma == u64::MAX { None } else { Some(ewma) },
             "error_rate": stats.error_rate(),
@@ -395,14 +400,11 @@ fast = [{{ provider = "test", model = "test-model" }}]
         ))
         .unwrap();
 
-        let model_map = ModelMap::from_config(&config);
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let model_map = ModelMap::from_config(&config, &mut tracker);
         let mut rr_state = RoundRobinState::new();
-        for (alias, candidates) in &config.model {
+        for alias in config.model.keys() {
             rr_state.register_alias(alias.clone());
-            for c in candidates {
-                tracker.register((Arc::from(c.provider.as_str()), Arc::from(c.model.as_str())));
-            }
         }
 
         Arc::new(AppState {
@@ -769,25 +771,31 @@ fast = [
         ))
         .unwrap();
 
-        let model_map = ModelMap::from_config(&config);
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let model_map = ModelMap::from_config(&config, &mut tracker);
         let mut rr_state = RoundRobinState::new();
-        for (alias, candidates) in &config.model {
+        for alias in config.model.keys() {
             rr_state.register_alias(alias.clone());
-            for c in candidates {
-                tracker.register((Arc::from(c.provider.as_str()), Arc::from(c.model.as_str())));
-            }
         }
 
         // Make beta look fast (10ms) and alpha slow (500ms) so the router
         // naturally prefers beta. We then pin affinity to alpha and verify
         // the router honours the pin instead of picking beta.
-        let alpha_key: CandidateKey = (Arc::from("alpha"), Arc::from("test-model"));
-        let beta_key: CandidateKey = (Arc::from("beta"), Arc::from("test-model"));
-        tracker.record_ttfc(&alpha_key, Duration::from_millis(500));
-        tracker.record_success(&alpha_key);
-        tracker.record_ttfc(&beta_key, Duration::from_millis(10));
-        tracker.record_success(&beta_key);
+        let fast_candidates = model_map.get("fast").unwrap();
+        let alpha_idx = fast_candidates
+            .iter()
+            .find(|c| c.provider_name == "alpha")
+            .unwrap()
+            .stats_index;
+        let beta_idx = fast_candidates
+            .iter()
+            .find(|c| c.provider_name == "beta")
+            .unwrap()
+            .stats_index;
+        tracker.record_ttfc(alpha_idx, Duration::from_millis(500));
+        tracker.record_success(alpha_idx);
+        tracker.record_ttfc(beta_idx, Duration::from_millis(10));
+        tracker.record_success(beta_idx);
 
         let state = Arc::new(AppState {
             model_map,

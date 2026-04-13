@@ -4,7 +4,6 @@ use http_body_util::{Full, StreamBody};
 use hyper::body::Frame;
 use reqwest::Client;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -54,7 +53,7 @@ pub async fn forward_request(
     path: &str,
     body_bytes: Bytes,
     is_streaming: bool,
-    gcp_token_provider: Option<&Arc<GcpTokenProvider>>,
+    gcp_token_provider: Option<&GcpTokenProvider>,
 ) -> Result<ProxyResult, Box<dyn std::error::Error + Send + Sync>> {
     let rewritten_body = rewrite_model(&body_bytes, &candidate.model)?;
 
@@ -403,6 +402,7 @@ mod tests {
             base_url: base_url.into(),
             api_key: Some("test-key".into()),
             kind,
+            stats_index: 0,
         }
     }
 

@@ -1,11 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-/// Key: (provider_name, model_name). Uses `Arc<str>` so cloning is a
-/// cheap reference-count bump instead of a heap allocation.
-pub type CandidateKey = (Arc<str>, Arc<str>);
 
 /// Time-windowed sliding buffer of request outcomes. Entries older than
 /// `window` are pruned on access, so errors age out naturally.
@@ -123,9 +119,14 @@ impl CandidateStats {
     }
 }
 
+/// Per-candidate stats stored in a flat `Vec`, addressed by a stable index
+/// minted at `register` time. Indices are safe because `register` only
+/// appends and the tracker is frozen behind `&Tracker` once moved into
+/// `AppState`. Cross-alias sharing is preserved by `ModelMap` deduping
+/// (provider, model) pairs to the same index.
 #[derive(Debug)]
 pub struct Tracker {
-    pub(crate) stats: HashMap<CandidateKey, Arc<CandidateStats>>,
+    stats: Vec<CandidateStats>,
     alpha: f64,
     error_window_duration: Duration,
     error_threshold: f64,
@@ -140,7 +141,7 @@ impl Tracker {
         max_error_window_entries: usize,
     ) -> Self {
         Self {
-            stats: HashMap::new(),
+            stats: Vec::new(),
             alpha,
             error_window_duration: Duration::from_secs(error_decay_secs),
             error_threshold,
@@ -148,52 +149,42 @@ impl Tracker {
         }
     }
 
-    pub fn register(&mut self, key: CandidateKey) {
-        let duration = self.error_window_duration;
-        let max_entries = self.max_error_window_entries;
-        self.stats
-            .entry(key)
-            .or_insert_with(|| Arc::new(CandidateStats::new(duration, max_entries)));
+    /// Allocates a new stats slot and returns its index. The index is stable
+    /// for the lifetime of the tracker.
+    pub fn register(&mut self) -> usize {
+        let idx = self.stats.len();
+        self.stats.push(CandidateStats::new(
+            self.error_window_duration,
+            self.max_error_window_entries,
+        ));
+        idx
     }
 
-    pub fn get(&self, key: &CandidateKey) -> Option<&Arc<CandidateStats>> {
-        self.stats.get(key)
+    pub fn stats(&self, index: usize) -> &CandidateStats {
+        &self.stats[index]
     }
 
-    pub fn record_ttfc(&self, key: &CandidateKey, ttfc: Duration) {
-        if let Some(stats) = self.stats.get(key) {
-            let ms = ttfc.as_millis() as u64;
-            stats.update_ewma(ms, self.alpha);
-        }
+    pub fn record_ttfc(&self, index: usize, ttfc: Duration) {
+        let ms = ttfc.as_millis() as u64;
+        self.stats[index].update_ewma(ms, self.alpha);
     }
 
-    pub fn record_success(&self, key: &CandidateKey) {
-        if let Some(stats) = self.stats.get(key) {
-            stats.record_success();
-        }
+    pub fn record_success(&self, index: usize) {
+        self.stats[index].record_success();
     }
 
-    pub fn record_error(&self, key: &CandidateKey) {
-        if let Some(stats) = self.stats.get(key) {
-            stats.record_error();
-        }
+    pub fn record_error(&self, index: usize) {
+        self.stats[index].record_error();
     }
 
-    pub fn is_degraded(&self, key: &CandidateKey) -> bool {
-        if let Some(stats) = self.stats.get(key) {
-            return stats.error_rate() > self.error_threshold;
-        }
-        false
+    pub fn is_degraded(&self, index: usize) -> bool {
+        self.stats[index].error_rate() > self.error_threshold
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn key(provider: &str, model: &str) -> CandidateKey {
-        (Arc::from(provider), Arc::from(model))
-    }
 
     #[test]
     fn ewma_first_observation_sets_directly() {
@@ -268,67 +259,62 @@ mod tests {
     #[test]
     fn tracker_not_degraded_below_threshold() {
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let k = key("openai", "gpt-4o-mini");
-        tracker.register(k.clone());
+        let idx = tracker.register();
         for _ in 0..6 {
-            tracker.record_success(&k);
+            tracker.record_success(idx);
         }
         for _ in 0..4 {
-            tracker.record_error(&k);
+            tracker.record_error(idx);
         }
-        assert!(!tracker.is_degraded(&k));
+        assert!(!tracker.is_degraded(idx));
     }
 
     #[test]
     fn tracker_degraded_above_threshold() {
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let k = key("openai", "gpt-4o-mini");
-        tracker.register(k.clone());
+        let idx = tracker.register();
         for _ in 0..4 {
-            tracker.record_success(&k);
+            tracker.record_success(idx);
         }
         for _ in 0..6 {
-            tracker.record_error(&k);
+            tracker.record_error(idx);
         }
-        assert!(tracker.is_degraded(&k));
+        assert!(tracker.is_degraded(idx));
     }
 
     #[test]
     fn tracker_degraded_recovers_when_errors_age_out() {
         let mut tracker = Tracker::new(0.3, 1, 0.5, 10_000);
-        let k = key("openai", "gpt-4o-mini");
-        tracker.register(k.clone());
+        let idx = tracker.register();
         for _ in 0..10 {
-            tracker.record_error(&k);
+            tracker.record_error(idx);
         }
-        assert!(tracker.is_degraded(&k));
+        assert!(tracker.is_degraded(idx));
 
         std::thread::sleep(Duration::from_millis(1100));
-        assert!(!tracker.is_degraded(&k));
+        assert!(!tracker.is_degraded(idx));
     }
 
     #[test]
     fn tracker_degraded_recovers_with_successes() {
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let k = key("openai", "gpt-4o-mini");
-        tracker.register(k.clone());
+        let idx = tracker.register();
         for _ in 0..10 {
-            tracker.record_error(&k);
+            tracker.record_error(idx);
         }
-        assert!(tracker.is_degraded(&k));
+        assert!(tracker.is_degraded(idx));
         for _ in 0..11 {
-            tracker.record_success(&k);
+            tracker.record_success(idx);
         }
-        assert!(!tracker.is_degraded(&k));
+        assert!(!tracker.is_degraded(idx));
     }
 
     #[test]
     fn record_ttfc_updates_ewma() {
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let k = key("groq", "llama");
-        tracker.register(k.clone());
-        tracker.record_ttfc(&k, Duration::from_millis(150));
-        let ewma = tracker.get(&k).unwrap().ewma_ms.load(Ordering::Relaxed);
+        let idx = tracker.register();
+        tracker.record_ttfc(idx, Duration::from_millis(150));
+        let ewma = tracker.stats(idx).ewma_ms.load(Ordering::Relaxed);
         assert_eq!(ewma, 150);
     }
 }

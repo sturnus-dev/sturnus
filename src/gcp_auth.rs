@@ -1,5 +1,4 @@
 use reqwest::Client;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -20,11 +19,11 @@ pub struct GcpTokenProvider {
 }
 
 impl GcpTokenProvider {
-    pub fn new(client: Client) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(client: Client) -> Self {
+        Self {
             client,
             cache: Mutex::new(None),
-        })
+        }
     }
 
     pub async fn get_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

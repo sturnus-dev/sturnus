@@ -68,21 +68,17 @@ async fn main() -> anyhow::Result<()> {
         "loaded config"
     );
 
-    let model_map = ModelMap::from_config(&config);
-
-    let mut tracker_inner = Tracker::new(
+    let mut tracker = Tracker::new(
         config.routing.ewma_alpha,
         config.routing.error_decay_secs,
         config.routing.error_threshold,
         config.routing.max_error_window_entries,
     );
-    let mut rr_state = RoundRobinState::new();
+    let model_map = ModelMap::from_config(&config, &mut tracker);
 
-    for (alias, candidates) in &config.model {
+    let mut rr_state = RoundRobinState::new();
+    for alias in config.model.keys() {
         rr_state.register_alias(alias.clone());
-        for c in candidates {
-            tracker_inner.register((Arc::from(c.provider.as_str()), Arc::from(c.model.as_str())));
-        }
     }
 
     let client = reqwest::Client::builder()
@@ -111,15 +107,8 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Metrics::new();
     let label_triples: Vec<(&str, &str, &str)> = model_map
-        .alias_names()
         .iter()
-        .flat_map(|alias| {
-            model_map
-                .get(alias)
-                .unwrap_or_default()
-                .iter()
-                .map(|c| (*alias, &*c.provider_name, &*c.model))
-        })
+        .map(|(alias, c)| (alias, c.provider_name.as_str(), c.model.as_str()))
         .collect();
     metrics.init_zero(&label_triples);
 
@@ -127,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState {
         model_map,
-        tracker: tracker_inner,
+        tracker,
         rr_state,
         client,
         explore_ratio,

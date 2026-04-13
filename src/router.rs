@@ -1,5 +1,5 @@
 use crate::model_map::ResolvedCandidate;
-use crate::tracker::{CandidateKey, Tracker};
+use crate::tracker::Tracker;
 use std::sync::atomic::Ordering;
 
 /// Separate route/explore counters per alias to avoid counter drift when
@@ -72,15 +72,8 @@ pub fn select_candidate<'a>(
 
     for (i, c) in candidates.iter().enumerate() {
         let item = (i, c);
-        let key = candidate_key(c);
-        let stats = match tracker.get(&key) {
-            Some(s) => s,
-            None => {
-                cold.push(item);
-                continue;
-            }
-        };
-        if tracker.is_degraded(&key) {
+        let stats = tracker.stats(c.stats_index);
+        if tracker.is_degraded(c.stats_index) {
             degraded.push(item);
         } else if stats.is_cold() {
             cold.push(item);
@@ -108,62 +101,52 @@ pub fn select_candidate<'a>(
     }
 
     warm.iter()
-        .min_by(|(_, a), (_, b)| {
-            let ka = candidate_key(a);
-            let kb = candidate_key(b);
-            let ewma_a = tracker.get(&ka).unwrap().ewma_ms.load(Ordering::Relaxed);
-            let ewma_b = tracker.get(&kb).unwrap().ewma_ms.load(Ordering::Relaxed);
-            ewma_a.cmp(&ewma_b)
-        })
+        .min_by_key(|(_, c)| tracker.stats(c.stats_index).ewma_ms.load(Ordering::Relaxed))
         .map(|(_, c)| *c)
-}
-
-pub fn candidate_key(c: &ResolvedCandidate) -> CandidateKey {
-    (c.provider_name.clone(), c.model.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_map::ProviderKind;
     use crate::tracker::Tracker;
-    use std::sync::Arc;
     use std::time::Duration;
 
-    fn make_candidate(provider: &str, model: &str) -> ResolvedCandidate {
+    fn make_candidate(provider: &str, model: &str, stats_index: usize) -> ResolvedCandidate {
         ResolvedCandidate {
-            provider_name: Arc::from(provider),
-            model: Arc::from(model),
+            provider_name: provider.to_string(),
+            model: model.to_string(),
             base_url: "http://localhost".to_string(),
             api_key: None,
-            kind: crate::model_map::ProviderKind::ApiKey,
+            kind: ProviderKind::ApiKey,
+            stats_index,
         }
     }
 
-    fn key(provider: &str, model: &str) -> CandidateKey {
-        (Arc::from(provider), Arc::from(model))
-    }
-
-    fn setup(candidates: &[ResolvedCandidate]) -> (Tracker, RoundRobinState) {
+    fn setup(specs: &[(&str, &str)]) -> (Vec<ResolvedCandidate>, Tracker, RoundRobinState) {
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
         let mut rr = RoundRobinState::new();
         rr.register_alias("test".to_string());
-        for c in candidates {
-            tracker.register(candidate_key(c));
-        }
-        (tracker, rr)
+        let candidates: Vec<_> = specs
+            .iter()
+            .map(|(provider, model)| {
+                let stats_index = tracker.register();
+                make_candidate(provider, model, stats_index)
+            })
+            .collect();
+        (candidates, tracker, rr)
     }
 
     #[test]
     fn empty_candidates_returns_none() {
         let candidates: Vec<ResolvedCandidate> = vec![];
-        let (tracker, rr) = setup(&candidates);
+        let (_, tracker, rr) = setup(&[]);
         assert!(select_candidate("test", &candidates, &tracker, &rr, 0.2).is_none());
     }
 
     #[test]
     fn all_cold_round_robins() {
-        let candidates = vec![make_candidate("a", "m1"), make_candidate("b", "m2")];
-        let (tracker, rr) = setup(&candidates);
+        let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
 
         let first = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
         let second = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
@@ -172,56 +155,47 @@ mod tests {
 
     #[test]
     fn picks_lowest_ewma() {
-        let candidates = vec![make_candidate("slow", "m1"), make_candidate("fast", "m2")];
-        let (tracker, rr) = setup(&candidates);
+        let (candidates, tracker, rr) = setup(&[("slow", "m1"), ("fast", "m2")]);
 
-        let slow_key = key("slow", "m1");
-        let fast_key = key("fast", "m2");
-        tracker.record_ttfc(&slow_key, Duration::from_millis(500));
-        tracker.record_ttfc(&fast_key, Duration::from_millis(100));
+        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(500));
+        tracker.record_ttfc(candidates[1].stats_index, Duration::from_millis(100));
 
         for _ in 0..10 {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-            assert_eq!(&*picked.provider_name, "fast");
+            assert_eq!(picked.provider_name, "fast");
         }
     }
 
     #[test]
     fn degraded_candidate_goes_to_explore() {
-        let candidates = vec![make_candidate("good", "m1"), make_candidate("bad", "m2")];
-        let (tracker, rr) = setup(&candidates);
+        let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
 
-        let good_key = key("good", "m1");
-        let bad_key = key("bad", "m2");
-
-        tracker.record_ttfc(&good_key, Duration::from_millis(200));
-        tracker.record_ttfc(&bad_key, Duration::from_millis(50));
+        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(200));
+        tracker.record_ttfc(candidates[1].stats_index, Duration::from_millis(50));
 
         for _ in 0..10 {
-            tracker.record_error(&bad_key);
+            tracker.record_error(candidates[1].stats_index);
         }
-        assert!(tracker.is_degraded(&bad_key));
+        assert!(tracker.is_degraded(candidates[1].stats_index));
 
         for _ in 0..20 {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
-            assert_eq!(&*picked.provider_name, "good");
+            assert_eq!(picked.provider_name, "good");
         }
     }
 
     #[test]
     fn explore_ratio_sends_traffic_to_cold() {
-        let candidates = vec![make_candidate("warm", "m1"), make_candidate("cold", "m2")];
-        let (tracker, rr) = setup(&candidates);
+        let (candidates, tracker, rr) = setup(&[("warm", "m1"), ("cold", "m2")]);
 
-        let warm_key = key("warm", "m1");
-        tracker.record_ttfc(&warm_key, Duration::from_millis(100));
+        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(100));
 
         // With explore_ratio=0.5, roughly half should go to the cold candidate
         let mut cold_picks = 0;
         let n = 100;
         for _ in 0..n {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.5).unwrap();
-            if &*picked.provider_name == "cold" {
+            if picked.provider_name == "cold" {
                 cold_picks += 1;
             }
         }
@@ -237,47 +211,39 @@ mod tests {
 
     #[test]
     fn traffic_shifts_when_latency_increases() {
-        let candidates = vec![make_candidate("a", "m1"), make_candidate("b", "m2")];
-        let (tracker, rr) = setup(&candidates);
+        let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
 
-        let ka = key("a", "m1");
-        let kb = key("b", "m2");
-
-        tracker.record_ttfc(&ka, Duration::from_millis(100));
-        tracker.record_ttfc(&kb, Duration::from_millis(300));
+        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(100));
+        tracker.record_ttfc(candidates[1].stats_index, Duration::from_millis(300));
 
         let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-        assert_eq!(&*picked.provider_name, "a");
+        assert_eq!(picked.provider_name, "a");
 
         for _ in 0..20 {
-            tracker.record_ttfc(&ka, Duration::from_millis(500));
+            tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(500));
         }
 
         let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
-        assert_eq!(&*picked.provider_name, "b");
+        assert_eq!(picked.provider_name, "b");
     }
 
     #[test]
     fn cold_candidate_with_errors_is_degraded_not_explored() {
-        let candidates = vec![make_candidate("good", "m1"), make_candidate("bad", "m2")];
-        let (tracker, rr) = setup(&candidates);
+        let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
 
-        let good_key = key("good", "m1");
-        let bad_key = key("bad", "m2");
-
-        tracker.record_ttfc(&good_key, Duration::from_millis(100));
+        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(100));
 
         for _ in 0..10 {
-            tracker.record_error(&bad_key);
+            tracker.record_error(candidates[1].stats_index);
         }
 
         // Cold (no EWMA) but degraded takes priority
-        assert!(tracker.get(&bad_key).unwrap().is_cold());
-        assert!(tracker.is_degraded(&bad_key));
+        assert!(tracker.stats(candidates[1].stats_index).is_cold());
+        assert!(tracker.is_degraded(candidates[1].stats_index));
 
         for _ in 0..20 {
             let picked = select_candidate("test", &candidates, &tracker, &rr, 0.5).unwrap();
-            assert_eq!(&*picked.provider_name, "good");
+            assert_eq!(picked.provider_name, "good");
         }
     }
 }

@@ -1,19 +1,19 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use std::sync::Arc;
 use std::time::Duration;
 
 use llmrouter::model_map::{ProviderKind, ResolvedCandidate};
 use llmrouter::proxy;
-use llmrouter::router::{self, candidate_key, RoundRobinState};
+use llmrouter::router::{self, RoundRobinState};
 use llmrouter::tracker::Tracker;
 
-fn make_candidate(provider: &str, model: &str) -> ResolvedCandidate {
+fn make_candidate(provider: &str, model: &str, stats_index: usize) -> ResolvedCandidate {
     ResolvedCandidate {
-        provider_name: Arc::from(provider),
-        model: Arc::from(model),
+        provider_name: provider.to_string(),
+        model: model.to_string(),
         base_url: "http://localhost".to_string(),
         api_key: None,
         kind: ProviderKind::ApiKey,
+        stats_index,
     }
 }
 
@@ -34,18 +34,21 @@ fn large_body() -> Vec<u8> {
     body
 }
 
-fn setup_tracker(candidates: &[ResolvedCandidate]) -> (Tracker, RoundRobinState) {
+fn build_candidates(specs: &[(&str, &str)]) -> (Vec<ResolvedCandidate>, Tracker, RoundRobinState) {
     let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
     let mut rr = RoundRobinState::new();
     rr.register_alias("fast".to_string());
-    for c in candidates {
-        let key = candidate_key(c);
-        tracker.register(key.clone());
-        // Warm up with some TTFC data
-        tracker.record_ttfc(&key, Duration::from_millis(100));
-        tracker.record_success(&key);
-    }
-    (tracker, rr)
+    let candidates: Vec<_> = specs
+        .iter()
+        .map(|(provider, model)| {
+            let stats_index = tracker.register();
+            // Warm up with some TTFC data
+            tracker.record_ttfc(stats_index, Duration::from_millis(100));
+            tracker.record_success(stats_index);
+            make_candidate(provider, model, stats_index)
+        })
+        .collect();
+    (candidates, tracker, rr)
 }
 
 fn bench_extract_model_small(c: &mut Criterion) {
@@ -84,12 +87,11 @@ fn bench_rewrite_model_large(c: &mut Criterion) {
 }
 
 fn bench_select_candidate(c: &mut Criterion) {
-    let candidates = vec![
-        make_candidate("openai", "gpt-4o-mini"),
-        make_candidate("groq", "llama-3.3-70b"),
-        make_candidate("vertex", "gemini-2.5-flash"),
-    ];
-    let (tracker, rr) = setup_tracker(&candidates);
+    let (candidates, tracker, rr) = build_candidates(&[
+        ("openai", "gpt-4o-mini"),
+        ("groq", "llama-3.3-70b"),
+        ("vertex", "gemini-2.5-flash"),
+    ]);
 
     c.bench_function("select_candidate/3_warm", |b| {
         b.iter(|| {
@@ -106,11 +108,8 @@ fn bench_select_candidate(c: &mut Criterion) {
 
 fn bench_full_pipeline_small(c: &mut Criterion) {
     let body = small_body();
-    let candidates = vec![
-        make_candidate("openai", "gpt-4o-mini"),
-        make_candidate("groq", "llama-3.3-70b"),
-    ];
-    let (tracker, rr) = setup_tracker(&candidates);
+    let (candidates, tracker, rr) =
+        build_candidates(&[("openai", "gpt-4o-mini"), ("groq", "llama-3.3-70b")]);
 
     c.bench_function("full_pipeline/small_body", |b| {
         b.iter(|| {
@@ -125,11 +124,8 @@ fn bench_full_pipeline_small(c: &mut Criterion) {
 
 fn bench_full_pipeline_large(c: &mut Criterion) {
     let body = large_body();
-    let candidates = vec![
-        make_candidate("openai", "gpt-4o-mini"),
-        make_candidate("groq", "llama-3.3-70b"),
-    ];
-    let (tracker, rr) = setup_tracker(&candidates);
+    let (candidates, tracker, rr) =
+        build_candidates(&[("openai", "gpt-4o-mini"), ("groq", "llama-3.3-70b")]);
 
     c.bench_function("full_pipeline/large_body_1mb", |b| {
         b.iter(|| {
