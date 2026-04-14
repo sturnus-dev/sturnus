@@ -1,6 +1,6 @@
 [package]
 name = "llmrouter"
-version = "3.1.0"
+version = "3.1.1"
 edition = "2021"
 authors = ["Danny Boland <danny@boland.dev>"]
 license = "MIT"
