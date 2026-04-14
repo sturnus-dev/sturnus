@@ -75,9 +75,15 @@ impl ProviderConfig {
     pub fn resolved_base_url(&self) -> Option<String> {
         self.base_url.clone().or_else(|| {
             if let Some(ref v) = self.vertex_ai {
+                // `global` has no regional hostname prefix.
+                let host = if v.location == "global" {
+                    "aiplatform.googleapis.com".to_string()
+                } else {
+                    format!("{}-aiplatform.googleapis.com", v.location)
+                };
                 return Some(format!(
-                    "https://{}-aiplatform.googleapis.com/v1beta1/projects/{}/locations/{}/endpoints/openapi",
-                    v.location, v.project_id, v.location
+                    "https://{}/v1beta1/projects/{}/locations/{}/endpoints/openapi",
+                    host, v.project_id, v.location
                 ));
             }
             if let Some(ref az) = self.azure_openai {
@@ -281,6 +287,23 @@ mod tests {
         assert!(url.contains("us-central1-aiplatform.googleapis.com"));
         assert!(url.contains("my-project"));
         assert!(url.contains("us-central1"));
+    }
+
+    #[test]
+    fn vertex_ai_global_location_omits_region_prefix() {
+        let provider = ProviderConfig {
+            vertex_ai: Some(VertexAiConfig {
+                project_id: "my-project".into(),
+                location: "global".into(),
+            }),
+            ..Default::default()
+        };
+        let url = provider.resolved_base_url().unwrap();
+        assert_eq!(
+            url,
+            "https://aiplatform.googleapis.com/v1beta1/projects/my-project/locations/global/endpoints/openapi"
+        );
+        assert!(!url.contains("global-aiplatform"));
     }
 
     #[test]
