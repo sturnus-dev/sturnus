@@ -235,15 +235,14 @@ pub async fn handle_request(
                 "response received"
             );
 
-            let mut builder = Response::builder().status(proxy_result.status);
-            for (k, v) in &proxy_result.headers {
-                builder = builder.header(k, v);
-            }
-            builder = builder.header("x-llmrouter-provider", provider);
-            builder = builder.header("x-session-affinity", format!("{provider}/{model}"));
-
             let body = proxy::into_hyper_body(proxy_result.body);
-            Ok(builder.body(body).expect("build proxy response"))
+            let mut resp = Response::new(body);
+            *resp.status_mut() = proxy_result.status;
+            let headers = resp.headers_mut();
+            headers.extend(proxy_result.headers);
+            headers.insert("x-llmrouter-provider", candidate.provider_header.clone());
+            headers.insert("x-session-affinity", candidate.affinity_header.clone());
+            Ok(resp)
         }
         Err(e) => {
             warn!(
@@ -395,7 +394,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
         .unwrap();
 
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let model_map = ModelMap::from_config(&config, &mut tracker);
+        let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
         let mut rr_state = RoundRobinState::new();
         for alias in config.model.keys() {
             rr_state.register_alias(alias.clone());
@@ -785,7 +784,7 @@ fast = [
         .unwrap();
 
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let model_map = ModelMap::from_config(&config, &mut tracker);
+        let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
         let mut rr_state = RoundRobinState::new();
         for alias in config.model.keys() {
             rr_state.register_alias(alias.clone());

@@ -15,6 +15,8 @@ fn make_candidate(provider: &str, model: &str, stats_index: usize) -> ResolvedCa
         api_key: None,
         kind: ProviderKind::ApiKey,
         stats_index,
+        provider_header: http::HeaderValue::from_str(provider).unwrap(),
+        affinity_header: http::HeaderValue::try_from(format!("{provider}/{model}")).unwrap(),
     }
 }
 

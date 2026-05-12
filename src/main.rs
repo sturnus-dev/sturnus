@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         config.routing.error_threshold,
         config.routing.max_error_window_entries,
     );
-    let model_map = ModelMap::from_config(&config, &mut tracker);
+    let model_map = ModelMap::from_config(&config, &mut tracker)?;
 
     let mut rr_state = RoundRobinState::new();
     for alias in config.model.keys() {

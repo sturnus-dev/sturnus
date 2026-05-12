@@ -953,6 +953,7 @@ dependencies = [
  "criterion",
  "dotenvy",
  "futures-util",
+ "http",
  "http-body",
  "http-body-util",
  "hyper",
