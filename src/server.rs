@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
+use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -48,13 +49,7 @@ fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
         }
     });
     let bytes = Bytes::from(serde_json::to_vec(&body).expect("serialize static JSON value"));
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(http_body_util::Either::Left(http_body_util::Full::new(
-            bytes,
-        )))
-        .expect("build error response")
+    json_response(status, bytes)
 }
 
 pub async fn handle_request(
@@ -71,10 +66,10 @@ pub async fn handle_request(
         if path == "/health" || path == "/healthz" {
             if state.shutting_down.load(Ordering::Relaxed) {
                 let body = Bytes::from(r#"{"status":"shutting_down"}"#);
-                return Ok(json_response(503, body));
+                return Ok(json_response(hyper::StatusCode::SERVICE_UNAVAILABLE, body));
             }
             let body = Bytes::from(r#"{"status":"ok"}"#);
-            return Ok(json_response(200, body));
+            return Ok(json_response(hyper::StatusCode::OK, body));
         }
         if path == "/status" {
             return Ok(build_status_response(&state));
@@ -83,13 +78,13 @@ pub async fn handle_request(
             return match state.metrics.encode() {
                 Ok(buf) => {
                     let body = Bytes::from(buf);
-                    let resp = Response::builder()
-                        .status(200)
-                        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                        .body(http_body_util::Either::Left(http_body_util::Full::new(
-                            body,
-                        )))
-                        .expect("build metrics response");
+                    let mut resp = Response::new(http_body_util::Either::Left(
+                        http_body_util::Full::new(body),
+                    ));
+                    resp.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+                    );
                     Ok(resp)
                 }
                 Err(e) => {
@@ -273,14 +268,14 @@ pub async fn handle_request(
     }
 }
 
-fn json_response(status: u16, body: Bytes) -> Response<BoxBody> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(http_body_util::Either::Left(http_body_util::Full::new(
-            body,
-        )))
-        .expect("build JSON response")
+fn json_response(status: hyper::StatusCode, body: Bytes) -> Response<BoxBody> {
+    let mut resp = Response::new(http_body_util::Either::Left(http_body_util::Full::new(
+        body,
+    )));
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    resp
 }
 
 pub async fn run_server(
@@ -374,7 +369,7 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
         "candidates": candidates,
     });
     let bytes = Bytes::from(serde_json::to_vec_pretty(&body).expect("serialize status JSON"));
-    json_response(200, bytes)
+    json_response(hyper::StatusCode::OK, bytes)
 }
 
 #[cfg(test)]
