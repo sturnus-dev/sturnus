@@ -213,9 +213,8 @@ pub async fn handle_request(
 
     match result {
         Ok(proxy_result) => {
-            state.tracker.record_ttfc(stats_index, proxy_result.ttfc);
-
             if proxy_result.status.is_success() {
+                state.tracker.record_ttfc(stats_index, proxy_result.ttfc);
                 state.tracker.record_success(stats_index);
             } else {
                 state.tracker.record_error(stats_index);
@@ -698,6 +697,25 @@ fast = [{{ provider = "test", model = "test-model" }}]
         (port, handle)
     }
 
+    async fn failing_upstream(status_line: &'static str) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = conn.read(&mut buf).await.unwrap();
+            let body = b"{\"error\":\"nope\"}";
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            conn.write_all(resp.as_bytes()).await.unwrap();
+            conn.write_all(body).await.unwrap();
+        });
+        (port, handle)
+    }
+
     fn start_server(
         state: Arc<AppState>,
     ) -> (
@@ -857,6 +875,51 @@ fast = [
             .to_str()
             .unwrap();
         assert_eq!(affinity, "test/test-model");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ewma_not_updated_on_error_response() {
+        let (mock_port, mock_handle) = failing_upstream("401 Unauthorized").await;
+        let state = test_state_with_upstream(mock_port);
+
+        let stats_index = state
+            .model_map
+            .get("fast")
+            .unwrap()
+            .first()
+            .unwrap()
+            .stats_index;
+
+        assert_eq!(
+            state
+                .tracker
+                .stats(stats_index)
+                .ewma_ms
+                .load(Ordering::Relaxed),
+            u64::MAX,
+            "precondition: EWMA should start uninitialized"
+        );
+
+        let (addr, _tx, _server) = start_server(state.clone());
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        assert_eq!(
+            state
+                .tracker
+                .stats(stats_index)
+                .ewma_ms
+                .load(Ordering::Relaxed),
+            u64::MAX,
+            "fast 4xx responses must not pollute EWMA latency stats"
+        );
 
         mock_handle.abort();
     }
