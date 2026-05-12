@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 llmrouter = { path = ".." }
 serde_json = "1"
+toml = "1"
 
 [[bin]]
 name = "extract_json"
@@ -22,6 +23,13 @@ bench = false
 [[bin]]
 name = "differential"
 path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_load"
+path = "fuzz_targets/config_load.rs"
 test = false
 doc = false
 bench = false

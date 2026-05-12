@@ -1,5 +1,6 @@
 use crate::config::{Config, ModelCandidate};
 use crate::tracker::Tracker;
+use http::HeaderValue;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +25,8 @@ pub struct ResolvedCandidate {
     /// Index into `Tracker`'s stats vector. Candidates with the same
     /// (provider, model) pair share a single stats slot across aliases.
     pub stats_index: usize,
+    pub provider_header: HeaderValue,
+    pub affinity_header: HeaderValue,
 }
 
 #[derive(Debug)]
@@ -35,33 +38,54 @@ impl ModelMap {
     /// Build the alias → candidates map and register each unique
     /// (provider, model) pair with the tracker. The returned candidates
     /// each carry a `stats_index` that points into the tracker.
-    pub fn from_config(config: &Config, tracker: &mut Tracker) -> Self {
+    pub fn from_config(config: &Config, tracker: &mut Tracker) -> anyhow::Result<Self> {
         let mut aliases = HashMap::new();
         let mut dedup: HashMap<(String, String), usize> = HashMap::new();
 
         for (alias, candidates) in &config.model {
-            let resolved: Vec<ResolvedCandidate> = candidates
+            let resolved = candidates
                 .iter()
-                .filter_map(|c: &ModelCandidate| {
-                    let prov = config.provider.get(&c.provider)?;
-                    let kind = prov.resolved_kind();
-                    let base_url = prov.resolved_base_url()?;
+                .map(|c: &ModelCandidate| {
+                    let prov = config.provider.get(&c.provider).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "alias '{}' references undefined provider '{}'",
+                            alias,
+                            c.provider
+                        )
+                    })?;
+                    let base_url = prov.resolved_base_url().ok_or_else(|| {
+                        anyhow::anyhow!("provider '{}' has no base_url configured", c.provider)
+                    })?;
+                    let provider_header = HeaderValue::try_from(c.provider.as_str())
+                        .map_err(|_| anyhow::anyhow!("invalid provider name '{}'", c.provider))?;
+                    let affinity_header =
+                        HeaderValue::try_from(format!("{}/{}", c.provider, c.model)).map_err(
+                            |_| {
+                                anyhow::anyhow!(
+                                    "invalid model name '{}' for provider '{}'",
+                                    c.model,
+                                    c.provider
+                                )
+                            },
+                        )?;
                     let key = (c.provider.clone(), c.model.clone());
                     let stats_index = *dedup.entry(key).or_insert_with(|| tracker.register());
-                    Some(ResolvedCandidate {
+                    Ok(ResolvedCandidate {
                         provider_name: c.provider.clone(),
                         model: c.model.clone(),
                         base_url,
                         api_key: prov.api_key.clone(),
-                        kind,
+                        kind: prov.resolved_kind(),
                         stats_index,
+                        provider_header,
+                        affinity_header,
                     })
                 })
-                .collect();
+                .collect::<anyhow::Result<Vec<_>>>()?;
             aliases.insert(alias.clone(), resolved);
         }
 
-        Self { aliases }
+        Ok(Self { aliases })
     }
 
     pub fn get(&self, alias: &str) -> Option<&[ResolvedCandidate]> {
@@ -100,7 +124,7 @@ cheap = [{ provider = "openai", model = "gpt-4o-mini" }]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let map = ModelMap::from_config(&config, &mut tracker);
+        let map = ModelMap::from_config(&config, &mut tracker).unwrap();
 
         let fast_idx = map.get("fast").unwrap()[0].stats_index;
         let cheap_idx = map.get("cheap").unwrap()[0].stats_index;
@@ -122,7 +146,7 @@ fast = [
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
-        let map = ModelMap::from_config(&config, &mut tracker);
+        let map = ModelMap::from_config(&config, &mut tracker).unwrap();
 
         let candidates = map.get("fast").unwrap();
         assert_ne!(candidates[0].stats_index, candidates[1].stats_index);
