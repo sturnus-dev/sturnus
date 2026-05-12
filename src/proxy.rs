@@ -167,14 +167,17 @@ pub fn extract_json_field<'a>(
                     j += 1;
                 }
                 if j < body.len() && body[j] == b'"' {
-                    // String value — find closing quote
+                    // Find closing quote — we don't support escaped chars.
                     let val_start = j + 1;
                     let mut k = val_start;
                     while k < body.len() && body[k] != b'"' {
                         if body[k] == b'\\' {
-                            k += 1; // skip escaped char
+                            return None;
                         }
                         k += 1;
+                    }
+                    if k >= body.len() {
+                        return None;
                     }
                     let val_bytes = &body[val_start..k];
                     if let Ok(val) = std::str::from_utf8(val_bytes) {
@@ -189,10 +192,11 @@ pub fn extract_json_field<'a>(
                 // Skip over other string values to avoid false matches
                 i += 1;
                 while i < body.len() && body[i] != b'"' {
-                    if body[i] == b'\\' {
+                    if body[i] == b'\\' && i + 1 < body.len() {
+                        i += 2;
+                    } else {
                         i += 1;
                     }
-                    i += 1;
                 }
             }
             _ => {}
@@ -229,10 +233,11 @@ pub fn extract_json_bool(body: &[u8], field: &str) -> Option<bool> {
             b'"' => {
                 i += 1;
                 while i < body.len() && body[i] != b'"' {
-                    if body[i] == b'\\' {
+                    if body[i] == b'\\' && i + 1 < body.len() {
+                        i += 2;
+                    } else {
                         i += 1;
                     }
-                    i += 1;
                 }
             }
             _ => {}
@@ -375,6 +380,30 @@ mod tests {
         let body = br#"{"model":"fast","messages":[{"model":"nested"}]}"#;
         let (_, val) = extract_json_field(body, "model").unwrap();
         assert_eq!(val, "fast");
+    }
+
+    #[test]
+    fn extract_fails_closed_on_escape_in_value() {
+        let body = br#"{"model":"a\"b"}"#;
+        assert_eq!(extract_json_field(body, "model"), None);
+    }
+
+    #[test]
+    fn extract_fails_closed_on_unterminated_string() {
+        let body = b"{\"model\":\"test";
+        assert_eq!(extract_json_field(body, "model"), None);
+    }
+
+    #[test]
+    fn extract_fails_closed_on_trailing_lone_backslash() {
+        let body = b"{\"model\":\"test\\";
+        assert_eq!(extract_json_field(body, "model"), None);
+    }
+
+    #[test]
+    fn extract_bool_handles_trailing_lone_backslash() {
+        let body = b"{\"name\":\"abc\\";
+        let _ = extract_json_bool(body, "stream");
     }
 
     #[test]
