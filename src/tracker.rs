@@ -70,15 +70,9 @@ impl CandidateStats {
     }
 
     fn lock_window(&self) -> std::sync::MutexGuard<'_, ErrorWindow> {
-        self.error_window.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("error window mutex was poisoned, resetting");
-            let window = poisoned.get_ref().window;
-            let max_entries = poisoned.get_ref().max_entries;
-            let mut guard = poisoned.into_inner();
-            *guard = ErrorWindow::new(window, max_entries);
-            self.error_window.clear_poison();
-            self.error_window.lock().unwrap()
-        })
+        self.error_window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn is_cold(&self) -> bool {
@@ -316,5 +310,33 @@ mod tests {
         tracker.record_ttfc(idx, Duration::from_millis(150));
         let ewma = tracker.stats(idx).ewma_ms.load(Ordering::Relaxed);
         assert_eq!(ewma, 150);
+    }
+
+    #[test]
+    fn poisoned_window_keeps_working_with_history_preserved() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let stats = CandidateStats::new(Duration::from_secs(30), 10_000);
+        stats.record_success();
+        stats.record_error();
+        assert!((stats.error_rate() - 0.5).abs() < f64::EPSILON);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = stats.error_window.lock().unwrap();
+            panic!("simulated panic while holding the lock");
+        }));
+        assert!(result.is_err(), "catch_unwind should have caught the panic");
+        assert!(
+            stats.error_window.is_poisoned(),
+            "mutex should be poisoned after holder panic"
+        );
+
+        assert!(
+            (stats.error_rate() - 0.5).abs() < f64::EPSILON,
+            "pre-poison history must survive recovery"
+        );
+        stats.record_success();
+        stats.record_success();
+        assert!((stats.error_rate() - 0.25).abs() < f64::EPSILON);
     }
 }
