@@ -1,6 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Time-windowed sliding buffer of request outcomes. Entries older than
@@ -69,16 +69,8 @@ impl CandidateStats {
         }
     }
 
-    fn lock_window(&self) -> std::sync::MutexGuard<'_, ErrorWindow> {
-        self.error_window.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("error window mutex was poisoned, resetting");
-            let window = poisoned.get_ref().window;
-            let max_entries = poisoned.get_ref().max_entries;
-            let mut guard = poisoned.into_inner();
-            *guard = ErrorWindow::new(window, max_entries);
-            self.error_window.clear_poison();
-            self.error_window.lock().unwrap()
-        })
+    fn lock_window(&self) -> parking_lot::MutexGuard<'_, ErrorWindow> {
+        self.error_window.lock()
     }
 
     pub fn is_cold(&self) -> bool {

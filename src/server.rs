@@ -1,9 +1,9 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use hyper_util::server::graceful::GracefulShutdown;
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -40,6 +40,19 @@ type BoxBody = http_body_util::Either<
     >,
 >;
 
+fn internal_error() -> Response<BoxBody> {
+    let body = Bytes::from_static(
+        br#"{"error":{"message":"internal server error","type":"internal_error"}}"#,
+    );
+    Response::builder()
+        .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "application/json")
+        .body(http_body_util::Either::Left(http_body_util::Full::new(
+            body,
+        )))
+        .expect("build internal error response")
+}
+
 fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
     let body = serde_json::json!({
         "error": {
@@ -47,14 +60,17 @@ fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
             "type": "invalid_request_error",
         }
     });
-    let bytes = Bytes::from(serde_json::to_vec(&body).expect("serialize static JSON value"));
+    let bytes = match serde_json::to_vec(&body) {
+        Ok(b) => Bytes::from(b),
+        Err(_) => return internal_error(),
+    };
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(http_body_util::Either::Left(http_body_util::Full::new(
             bytes,
         )))
-        .expect("build error response")
+        .unwrap_or_else(|_| internal_error())
 }
 
 pub async fn handle_request(
@@ -89,7 +105,7 @@ pub async fn handle_request(
                         .body(http_body_util::Either::Left(http_body_util::Full::new(
                             body,
                         )))
-                        .expect("build metrics response");
+                        .unwrap_or_else(|_| internal_error());
                     Ok(resp)
                 }
                 Err(e) => {
@@ -248,7 +264,10 @@ pub async fn handle_request(
             builder = builder.header("x-session-affinity", format!("{provider}/{model}"));
 
             let body = proxy::into_hyper_body(proxy_result.body);
-            Ok(builder.body(body).expect("build proxy response"))
+            Ok(builder.body(body).unwrap_or_else(|e| {
+                error!(error = %e, "failed to build proxy response from upstream headers");
+                internal_error()
+            }))
         }
         Err(e) => {
             warn!(
@@ -280,7 +299,7 @@ fn json_response(status: u16, body: Bytes) -> Response<BoxBody> {
         .body(http_body_util::Either::Left(http_body_util::Full::new(
             body,
         )))
-        .expect("build JSON response")
+        .unwrap_or_else(|_| internal_error())
 }
 
 pub async fn run_server(
@@ -305,11 +324,12 @@ pub async fn run_server(
                 let io = TokioIo::new(stream);
                 let state = state.clone();
 
-                let conn = http1::Builder::new()
+                let conn = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(io, service_fn(move |req| {
                         let state = state.clone();
                         async move { handle_request(req, state).await }
-                    }));
+                    }))
+                    .into_owned();
 
                 let conn = graceful.watch(conn);
 

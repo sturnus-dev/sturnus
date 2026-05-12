@@ -24,6 +24,7 @@ anyhow = "1"
 shellexpand = { version = "3", default-features = false, features = ["base-0"] }
 dotenvy = "0.15"
 prometheus = { version = "0.14", default-features = false }
+parking_lot = "0.12"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
