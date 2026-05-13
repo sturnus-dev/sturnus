@@ -11,6 +11,10 @@ pub struct Config {
     pub model: HashMap<String, Vec<ModelCandidate>>,
     #[serde(default)]
     pub routing: RoutingConfig,
+    /// Labels merged into outbound bodies as `labels` for opt-in Vertex
+    /// providers. Typically deployment identity from env vars.
+    #[serde(default)]
+    pub attribution: HashMap<String, String>,
 }
 
 fn default_listen() -> String {
@@ -36,6 +40,9 @@ pub struct ProviderConfig {
 pub struct VertexAiConfig {
     pub project_id: String,
     pub location: String,
+    /// Merge top-level `[attribution]` into the request as Vertex `labels`.
+    #[serde(default)]
+    pub attribution: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,7 +211,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if !(0.0..=1.0).contains(&self.routing.ewma_alpha) {
             anyhow::bail!(
                 "ewma_alpha must be between 0.0 and 1.0, got {}",
@@ -266,6 +273,15 @@ impl Config {
                 }
             }
         }
+        let any_attribution_opt_in = self
+            .provider
+            .values()
+            .any(|p| p.vertex_ai.as_ref().map(|v| v.attribution).unwrap_or(false));
+        if any_attribution_opt_in && self.attribution.is_empty() {
+            anyhow::bail!(
+                "at least one provider has vertex_ai.attribution = true but the top-level [attribution] map is empty"
+            );
+        }
         Ok(())
     }
 }
@@ -280,6 +296,7 @@ mod tests {
             vertex_ai: Some(VertexAiConfig {
                 project_id: "my-project".into(),
                 location: "us-central1".into(),
+                attribution: false,
             }),
             ..Default::default()
         };
@@ -295,6 +312,7 @@ mod tests {
             vertex_ai: Some(VertexAiConfig {
                 project_id: "my-project".into(),
                 location: "global".into(),
+                attribution: false,
             }),
             ..Default::default()
         };
@@ -312,6 +330,7 @@ mod tests {
             vertex_ai: Some(VertexAiConfig {
                 project_id: "p".into(),
                 location: "l".into(),
+                attribution: false,
             }),
             ..Default::default()
         };
@@ -325,6 +344,7 @@ mod tests {
             vertex_ai: Some(VertexAiConfig {
                 project_id: "p".into(),
                 location: "l".into(),
+                attribution: false,
             }),
             ..Default::default()
         };
@@ -510,6 +530,83 @@ test = [{ provider = "anthropic", model = "claude-sonnet-4-20250514" }]
             "https://api.anthropic.com/v1"
         );
         assert!(matches!(p.resolved_kind(), ProviderKind::Anthropic { .. }));
+    }
+
+    #[test]
+    fn attribution_opt_in_requires_non_empty_attribution_map() {
+        let toml_str = r#"
+[provider.vertex]
+api_key = "k"
+vertex_ai = { project_id = "p", location = "l", attribution = true }
+
+[model]
+test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn attribution_opt_in_with_attribution_map_validates() {
+        let toml_str = r#"
+[attribution]
+service = "my-service"
+owner = "team-x"
+
+[provider.vertex]
+api_key = "k"
+vertex_ai = { project_id = "p", location = "l", attribution = true }
+
+[model]
+test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.attribution.get("service").unwrap(), "my-service");
+        assert!(
+            config.provider["vertex"]
+                .vertex_ai
+                .as_ref()
+                .unwrap()
+                .attribution
+        );
+    }
+
+    #[test]
+    fn attribution_defaults_off_for_vertex() {
+        let toml_str = r#"
+[provider.vertex]
+api_key = "k"
+vertex_ai = { project_id = "p", location = "l" }
+
+[model]
+test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_ok());
+        assert!(
+            !config.provider["vertex"]
+                .vertex_ai
+                .as_ref()
+                .unwrap()
+                .attribution
+        );
+    }
+
+    #[test]
+    fn attribution_field_does_not_exist_on_non_vertex_providers() {
+        // `attribution` lives inside the vertex_ai shorthand, so non-Vertex
+        // providers can't set it — the type system enforces Vertex-only.
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "k"
+
+[model]
+test = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.provider["openai"].vertex_ai.is_none());
     }
 
     #[test]

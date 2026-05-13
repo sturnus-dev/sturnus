@@ -1,6 +1,6 @@
 [package]
 name = "llmrouter"
-version = "3.1.2"
+version = "3.2.0"
 edition = "2021"
 authors = ["Danny Boland <danny@boland.dev>"]
 license = "MIT"
@@ -27,12 +27,7 @@ dotenvy = "0.15"
 prometheus = { version = "0.14", default-features = false }
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
-
-[[bench]]
-name = "routing"
-harness = false
 
 [profile.release]
 lto = true

@@ -66,3 +66,11 @@ error_decay_secs = 300     # time window for error rate calculation; old errors 
 connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
 session_ttl_secs = 1800    # sticky session TTL in seconds (default 30 min)
+
+# Vertex billing labels: merged into outbound bodies for any vertex_ai
+# provider with `attribution = true` (add the flag to its vertex_ai
+# block above). Sidecar wins on key collision.
+# [attribution]
+# service = "${SERVICE_NAME}"
+# owner = "${OWNER}"
+# env = "${ENV}"

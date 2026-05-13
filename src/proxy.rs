@@ -3,6 +3,8 @@ use futures_util::StreamExt;
 use http_body_util::{Full, StreamBody};
 use hyper::body::Frame;
 use reqwest::Client;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::time::Instant;
 use tracing::{debug, warn};
@@ -51,11 +53,16 @@ pub async fn forward_request(
     client: &Client,
     candidate: &ResolvedCandidate,
     path: &str,
-    body_bytes: Bytes,
+    mut body: Map<String, Value>,
     is_streaming: bool,
     gcp_token_provider: Option<&GcpTokenProvider>,
 ) -> Result<ProxyResult, Box<dyn std::error::Error + Send + Sync>> {
-    let rewritten_body = rewrite_model(&body_bytes, &candidate.model)?;
+    prepare_body(
+        &mut body,
+        &candidate.model,
+        candidate.attribution_labels.as_deref(),
+    );
+    let body_bytes = Bytes::from(serde_json::to_vec(&body)?);
 
     let url = build_upstream_url(candidate, path);
     debug!(url = %url, model = %candidate.model, provider = %candidate.provider_name, "forwarding request");
@@ -88,7 +95,7 @@ pub async fn forward_request(
     }
 
     let t0 = Instant::now();
-    let response = req.body(rewritten_body).send().await?;
+    let response = req.body(body_bytes).send().await?;
 
     let status = hyper::StatusCode::from_u16(response.status().as_u16())?;
 
@@ -143,123 +150,29 @@ pub async fn forward_request(
     }
 }
 
-/// Extract the value of a top-level JSON string field by scanning raw bytes.
-/// Returns the byte range of the value (excluding quotes) and the value itself.
-/// Only scans top-level keys (brace depth == 1) to avoid matching nested fields.
-pub fn extract_json_field<'a>(
-    body: &'a [u8],
-    field: &str,
-) -> Option<(std::ops::Range<usize>, &'a str)> {
-    let needle = format!("\"{}\"", field);
-    let needle_bytes = needle.as_bytes();
-    let mut depth: u32 = 0;
-    let mut i = 0;
-
-    while i < body.len() {
-        match body[i] {
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            b'"' if depth == 1 && body[i..].starts_with(needle_bytes) => {
-                // Found the key at top level — skip past `"field"` and any `: `
-                let after_key = i + needle_bytes.len();
-                let mut j = after_key;
-                while j < body.len() && (body[j] == b':' || body[j] == b' ') {
-                    j += 1;
-                }
-                if j < body.len() && body[j] == b'"' {
-                    // Find closing quote — we don't support escaped chars.
-                    let val_start = j + 1;
-                    let mut k = val_start;
-                    while k < body.len() && body[k] != b'"' {
-                        if body[k] == b'\\' {
-                            return None;
-                        }
-                        k += 1;
-                    }
-                    if k >= body.len() {
-                        return None;
-                    }
-                    let val_bytes = &body[val_start..k];
-                    if let Ok(val) = std::str::from_utf8(val_bytes) {
-                        return Some((val_start..k, val));
-                    }
-                }
-                // Non-string value (e.g., `"stream": true`) — skip
-                i = after_key;
-                continue;
-            }
-            b'"' => {
-                // Skip over other string values to avoid false matches
-                i += 1;
-                while i < body.len() && body[i] != b'"' {
-                    if body[i] == b'\\' && i + 1 < body.len() {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Check if a top-level JSON boolean field is `true` by scanning raw bytes.
-pub fn extract_json_bool(body: &[u8], field: &str) -> Option<bool> {
-    let needle = format!("\"{}\"", field);
-    let needle_bytes = needle.as_bytes();
-    let mut depth: u32 = 0;
-    let mut i = 0;
-
-    while i < body.len() {
-        match body[i] {
-            b'{' => depth += 1,
-            b'}' => depth = depth.saturating_sub(1),
-            b'"' if depth == 1 && body[i..].starts_with(needle_bytes) => {
-                let after_key = i + needle_bytes.len();
-                let mut j = after_key;
-                while j < body.len() && (body[j] == b':' || body[j] == b' ') {
-                    j += 1;
-                }
-                if body[j..].starts_with(b"true") {
-                    return Some(true);
-                } else if body[j..].starts_with(b"false") {
-                    return Some(false);
-                }
-                return None;
-            }
-            b'"' => {
-                i += 1;
-                while i < body.len() && body[i] != b'"' {
-                    if body[i] == b'\\' && i + 1 < body.len() {
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Splice the real model name into the JSON body without full parsing.
-pub fn rewrite_model(
-    body: &[u8],
+/// Replace the model alias with the resolved upstream model name, and
+/// merge sidecar attribution labels into `labels` (sidecar wins on key
+/// collision; disjoint client keys preserved).
+pub fn prepare_body(
+    body: &mut Map<String, Value>,
     real_model: &str,
-) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-    let (range, _) =
-        extract_json_field(body, "model").ok_or("missing 'model' field in request body")?;
+    attribution_labels: Option<&BTreeMap<String, String>>,
+) {
+    body.insert("model".to_string(), Value::String(real_model.to_string()));
 
-    let mut result = Vec::with_capacity(body.len() + real_model.len());
-    result.extend_from_slice(&body[..range.start]);
-    result.extend_from_slice(real_model.as_bytes());
-    result.extend_from_slice(&body[range.end..]);
-    Ok(Bytes::from(result))
+    if let Some(labels) = attribution_labels {
+        let target = body
+            .entry("labels")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !target.is_object() {
+            *target = Value::Object(Map::new());
+        }
+        if let Value::Object(map) = target {
+            for (k, v) in labels {
+                map.insert(k.clone(), Value::String(v.clone()));
+            }
+        }
+    }
 }
 
 /// On error, emits an SSE error event and terminates the stream (instead of
@@ -341,87 +254,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rewrite_model_replaces_alias() {
-        let body = br#"{"model":"fast","messages":[{"role":"user","content":"hi"}]}"#;
-        let result = rewrite_model(body, "gpt-4o-mini").unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(parsed["model"], "gpt-4o-mini");
-        assert_eq!(parsed["messages"][0]["content"], "hi");
+    fn map_from(json: &str) -> Map<String, Value> {
+        match serde_json::from_str(json).unwrap() {
+            Value::Object(m) => m,
+            _ => panic!("test JSON is not an object"),
+        }
+    }
+
+    fn labels_of(items: &[(&str, &str)]) -> BTreeMap<String, String> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
-    fn rewrite_model_preserves_other_fields() {
-        let body = br#"{"model":"smart","stream":true,"temperature":0.7}"#;
-        let result = rewrite_model(body, "gpt-4.1").unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
-        assert_eq!(parsed["model"], "gpt-4.1");
-        assert_eq!(parsed["stream"], true);
-        assert_eq!(parsed["temperature"], 0.7);
+    fn prepare_body_replaces_model_alias() {
+        let mut body = map_from(r#"{"model":"fast","temperature":0.7}"#);
+        prepare_body(&mut body, "gpt-4o-mini", None);
+        assert_eq!(body["model"], Value::String("gpt-4o-mini".into()));
+        assert_eq!(body["temperature"], Value::from(0.7));
     }
 
     #[test]
-    fn extract_model_from_large_body() {
-        // Simulate a body with a large base64 image after the model field
-        let prefix = br#"{"model":"fast","messages":[{"role":"user","content":"#;
-        let image_data = "A".repeat(1_000_000); // 1MB of data
-        let suffix = br#""}]}"#;
-        let mut body = Vec::with_capacity(prefix.len() + image_data.len() + suffix.len());
-        body.extend_from_slice(prefix);
-        body.extend_from_slice(image_data.as_bytes());
-        body.extend_from_slice(suffix);
-
-        let (_, val) = extract_json_field(&body, "model").unwrap();
-        assert_eq!(val, "fast");
+    fn prepare_body_without_attribution_leaves_labels_untouched() {
+        let mut body = map_from(r#"{"model":"x","labels":{"client":"v"}}"#);
+        prepare_body(&mut body, "real-model", None);
+        assert_eq!(body["labels"]["client"], "v");
     }
 
     #[test]
-    fn extract_ignores_nested_model_field() {
-        let body = br#"{"model":"fast","messages":[{"model":"nested"}]}"#;
-        let (_, val) = extract_json_field(body, "model").unwrap();
-        assert_eq!(val, "fast");
+    fn prepare_body_injects_labels_into_empty_body() {
+        let mut body = map_from(r#"{"model":"x"}"#);
+        let labels = labels_of(&[("service", "foo")]);
+        prepare_body(&mut body, "real-model", Some(&labels));
+        assert_eq!(body["labels"]["service"], "foo");
     }
 
     #[test]
-    fn extract_fails_closed_on_escape_in_value() {
-        let body = br#"{"model":"a\"b"}"#;
-        assert_eq!(extract_json_field(body, "model"), None);
+    fn prepare_body_merges_with_existing_labels_sidecar_wins() {
+        let mut body =
+            map_from(r#"{"model":"x","labels":{"tenant":"abc","service":"client-set"}}"#);
+        let labels = labels_of(&[("service", "sidecar-set"), ("owner", "team-a")]);
+        prepare_body(&mut body, "real-model", Some(&labels));
+        assert_eq!(body["labels"]["tenant"], "abc");
+        assert_eq!(body["labels"]["service"], "sidecar-set");
+        assert_eq!(body["labels"]["owner"], "team-a");
     }
 
     #[test]
-    fn extract_fails_closed_on_unterminated_string() {
-        let body = b"{\"model\":\"test";
-        assert_eq!(extract_json_field(body, "model"), None);
-    }
-
-    #[test]
-    fn extract_fails_closed_on_trailing_lone_backslash() {
-        let body = b"{\"model\":\"test\\";
-        assert_eq!(extract_json_field(body, "model"), None);
-    }
-
-    #[test]
-    fn extract_bool_handles_trailing_lone_backslash() {
-        let body = b"{\"name\":\"abc\\";
-        let _ = extract_json_bool(body, "stream");
-    }
-
-    #[test]
-    fn extract_bool_true() {
-        let body = br#"{"model":"test","stream":true}"#;
-        assert_eq!(extract_json_bool(body, "stream"), Some(true));
-    }
-
-    #[test]
-    fn extract_bool_false() {
-        let body = br#"{"model":"test","stream":false}"#;
-        assert_eq!(extract_json_bool(body, "stream"), Some(false));
-    }
-
-    #[test]
-    fn extract_bool_missing() {
-        let body = br#"{"model":"test"}"#;
-        assert_eq!(extract_json_bool(body, "stream"), None);
+    fn prepare_body_overwrites_when_existing_labels_wrong_shape() {
+        let mut body = map_from(r#"{"model":"x","labels":"not-an-object"}"#);
+        let labels = labels_of(&[("service", "foo")]);
+        prepare_body(&mut body, "real-model", Some(&labels));
+        assert_eq!(body["labels"]["service"], "foo");
+        assert!(body["labels"].is_object());
     }
 
     fn make_candidate(kind: ProviderKind, base_url: &str) -> ResolvedCandidate {
@@ -434,6 +321,7 @@ mod tests {
             stats_index: 0,
             provider_header: http::HeaderValue::from_static("test"),
             affinity_header: http::HeaderValue::from_static("test/gpt-4o"),
+            attribution_labels: None,
         }
     }
 

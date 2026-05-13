@@ -122,6 +122,7 @@ mod tests {
             stats_index,
             provider_header: http::HeaderValue::from_str(provider).unwrap(),
             affinity_header: http::HeaderValue::try_from(format!("{provider}/{model}")).unwrap(),
+            attribution_labels: None,
         }
     }
 

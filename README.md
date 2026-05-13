@@ -107,6 +107,22 @@ error_decay_secs = 300     # time window for error rate calculation; old errors 
 
 Environment variables in `${VAR}` syntax are interpolated at config load time.
 
+### Vertex billing attribution
+
+For Vertex providers, llmrouter can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:
+
+```toml
+[attribution]
+service = "${SERVICE_NAME}"
+owner = "${OWNER}"
+env = "${ENV}"
+
+[provider.vertex]
+vertex_ai = { project_id = "my-project", location = "us-central1", attribution = true }
+```
+
+Sidecar keys take precedence over any client-supplied `labels` keys with the same name; disjoint client keys are preserved. The feature is currently scoped to Vertex only. Keys and values must conform to Vertex naming rules (`[a-z][a-z0-9_-]{0,62}`).
+
 ### Loading secrets
 
 Where environment variables are available in an .env file, this can be passed with `--env-file`:

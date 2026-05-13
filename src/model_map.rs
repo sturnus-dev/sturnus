@@ -1,7 +1,8 @@
 use crate::config::{Config, ModelCandidate};
 use crate::tracker::Tracker;
 use http::HeaderValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderKind {
@@ -27,6 +28,10 @@ pub struct ResolvedCandidate {
     pub stats_index: usize,
     pub provider_header: HeaderValue,
     pub affinity_header: HeaderValue,
+    /// Labels to merge into the outbound body as Vertex `labels`.
+    /// `None` unless this provider opted in. Shared across candidates
+    /// since the contents are immutable after config load.
+    pub attribution_labels: Option<Arc<BTreeMap<String, String>>>,
 }
 
 #[derive(Debug)]
@@ -41,6 +46,14 @@ impl ModelMap {
     pub fn from_config(config: &Config, tracker: &mut Tracker) -> anyhow::Result<Self> {
         let mut aliases = HashMap::new();
         let mut dedup: HashMap<(String, String), usize> = HashMap::new();
+
+        let attribution_template: Arc<BTreeMap<String, String>> = Arc::new(
+            config
+                .attribution
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
 
         for (alias, candidates) in &config.model {
             let resolved = candidates
@@ -70,6 +83,12 @@ impl ModelMap {
                         )?;
                     let key = (c.provider.clone(), c.model.clone());
                     let stats_index = *dedup.entry(key).or_insert_with(|| tracker.register());
+                    let attribution_labels = prov
+                        .vertex_ai
+                        .as_ref()
+                        .map(|v| v.attribution)
+                        .unwrap_or(false)
+                        .then(|| Arc::clone(&attribution_template));
                     Ok(ResolvedCandidate {
                         provider_name: c.provider.clone(),
                         model: c.model.clone(),
@@ -79,6 +98,7 @@ impl ModelMap {
                         stats_index,
                         provider_header,
                         affinity_header,
+                        attribution_labels,
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -129,6 +149,59 @@ cheap = [{ provider = "openai", model = "gpt-4o-mini" }]
         let fast_idx = map.get("fast").unwrap()[0].stats_index;
         let cheap_idx = map.get("cheap").unwrap()[0].stats_index;
         assert_eq!(fast_idx, cheap_idx);
+    }
+
+    #[test]
+    fn attribution_propagates_only_to_opt_in_candidates() {
+        let toml_str = r#"
+[attribution]
+service = "my-service"
+owner = "team-x"
+
+[provider.vertex-attr]
+api_key = "k"
+vertex_ai = { project_id = "p", location = "l", attribution = true }
+
+[provider.vertex-no-attr]
+api_key = "k"
+vertex_ai = { project_id = "p", location = "l" }
+
+[model]
+attr   = [{ provider = "vertex-attr",    model = "google/gemini-2.5-flash" }]
+noattr = [{ provider = "vertex-no-attr", model = "google/gemini-2.5-flash" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let map = ModelMap::from_config(&config, &mut tracker).unwrap();
+
+        let attr = &map.get("attr").unwrap()[0];
+        let labels = attr
+            .attribution_labels
+            .as_ref()
+            .expect("opt-in candidate should have labels");
+        assert_eq!(labels.get("service").unwrap(), "my-service");
+        assert_eq!(labels.get("owner").unwrap(), "team-x");
+        assert_eq!(labels.len(), 2);
+
+        let noattr = &map.get("noattr").unwrap()[0];
+        assert!(noattr.attribution_labels.is_none());
+    }
+
+    #[test]
+    fn attribution_labels_none_when_attribution_map_empty() {
+        let toml_str = r#"
+[provider.vertex]
+api_key = "k"
+vertex_ai = { project_id = "p", location = "l" }
+
+[model]
+test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let map = ModelMap::from_config(&config, &mut tracker).unwrap();
+        assert!(map.get("test").unwrap()[0].attribution_labels.is_none());
     }
 
     #[test]

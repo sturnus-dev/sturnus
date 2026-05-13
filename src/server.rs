@@ -120,8 +120,25 @@ pub async fn handle_request(
         }
     };
 
-    let alias = match proxy::extract_json_field(&body_bytes, "model") {
-        Some((_, val)) => val.to_string(),
+    let body_map: serde_json::Map<String, serde_json::Value> =
+        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            Ok(serde_json::Value::Object(m)) => m,
+            Ok(_) => {
+                return Ok(json_error(
+                    hyper::StatusCode::BAD_REQUEST,
+                    "request body must be a JSON object",
+                ));
+            }
+            Err(e) => {
+                return Ok(json_error(
+                    hyper::StatusCode::BAD_REQUEST,
+                    &format!("request body is not valid JSON: {e}"),
+                ));
+            }
+        };
+
+    let alias = match body_map.get("model").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
         None => {
             return Ok(json_error(
                 hyper::StatusCode::BAD_REQUEST,
@@ -183,7 +200,10 @@ pub async fn handle_request(
 
     let stats_index = candidate.stats_index;
 
-    let is_streaming = proxy::extract_json_bool(&body_bytes, "stream").unwrap_or(false);
+    let is_streaming = body_map
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     info!(
         alias = %alias,
@@ -197,7 +217,7 @@ pub async fn handle_request(
         &state.client,
         candidate,
         &path,
-        body_bytes,
+        body_map,
         is_streaming,
         state.gcp_token_provider.as_ref(),
     )
