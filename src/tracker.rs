@@ -94,6 +94,8 @@ impl CandidateStats {
     pub fn update_ewma(&self, observed_ms: u64, alpha: f64) {
         loop {
             let old = self.ewma_ms.load(Ordering::Relaxed);
+            // EWMA of positive millis; rounds to a bounded non-negative u64.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let new_val = if old == u64::MAX {
                 observed_ms
             } else {
@@ -159,6 +161,8 @@ impl Tracker {
     }
 
     pub fn record_ttfc(&self, index: usize, ttfc: Duration) {
+        // request latency in millis always fits u64.
+        #[allow(clippy::cast_possible_truncation)]
         let ms = ttfc.as_millis() as u64;
         self.stats[index].update_ewma(ms, self.alpha);
     }

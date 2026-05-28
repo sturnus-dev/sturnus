@@ -48,6 +48,8 @@ fn json_error(status: hyper::StatusCode, message: &str) -> Response<BoxBody> {
             "type": "invalid_request_error",
         }
     });
+    // serializing a static JSON value can't fail.
+    #[allow(clippy::expect_used)]
     let bytes = Bytes::from(serde_json::to_vec(&body).expect("serialize static JSON value"));
     json_response(status, bytes)
 }
@@ -147,18 +149,15 @@ pub async fn handle_request(
         }
     };
 
-    let candidates = match state.model_map.get(&alias) {
-        Some(c) => c,
-        None => {
-            let available = state.model_map.alias_names();
-            return Ok(json_error(
-                hyper::StatusCode::BAD_REQUEST,
-                &format!(
-                    "unknown model alias '{}', available: {:?}",
-                    alias, available
-                ),
-            ));
-        }
+    let Some(candidates) = state.model_map.get(&alias) else {
+        let available = state.model_map.alias_names();
+        return Ok(json_error(
+            hyper::StatusCode::BAD_REQUEST,
+            &format!(
+                "unknown model alias '{}', available: {:?}",
+                alias, available
+            ),
+        ));
     };
 
     let affinity: Option<(&str, &str)> = affinity_header
@@ -387,6 +386,8 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
     let body = serde_json::json!({
         "candidates": candidates,
     });
+    // serializing the status object can't fail.
+    #[allow(clippy::expect_used)]
     let bytes = Bytes::from(serde_json::to_vec_pretty(&body).expect("serialize status JSON"));
     json_response(hyper::StatusCode::OK, bytes)
 }
