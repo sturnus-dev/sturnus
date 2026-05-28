@@ -142,6 +142,10 @@ llmrouter --env-file /secrets/.env
 | GET | `/status` | Returns current EWMA, error rate, and status per candidate |
 | GET | `/metrics` | Prometheus metrics (request counts, TTFC histogram, errors) |
 
+## Logging
+
+Structured logging via `tracing`: human-readable and coloured on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Override with `--log-format <auto|pretty|json>` or `LLMROUTER_LOG_FORMAT`; filter with `RUST_LOG` (default `llmrouter=info`).
+
 ## Session affinity
 
 Every response includes an `x-session-affinity` header (e.g. `openai/gpt-4o-mini`). Pass it back on subsequent requests to pin to the same provider — useful for multi-turn conversations where context is provider-specific:

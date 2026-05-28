@@ -14,6 +14,14 @@ use llmrouter::router::RoundRobinState;
 use llmrouter::server::AppState;
 use llmrouter::tracker::Tracker;
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum LogFormat {
+    /// Pretty on a terminal, JSON when piped/redirected.
+    Auto,
+    Pretty,
+    Json,
+}
+
 #[derive(Parser)]
 #[command(name = "llmrouter", about = "Lightweight LLM load-balancing sidecar")]
 struct Cli {
@@ -28,6 +36,10 @@ struct Cli {
     /// Load env vars from a directory of secret files (one file per var)
     #[arg(long = "env-dir")]
     env_dir: Option<PathBuf>,
+
+    /// Log output format
+    #[arg(long, value_enum, default_value = "auto", env = "LLMROUTER_LOG_FORMAT")]
+    log_format: LogFormat,
 }
 
 // startup banner, shown only on an interactive terminal so it stays out of structured logs.
@@ -46,22 +58,34 @@ fn print_banner() {
     );
 }
 
+fn init_logging(format: LogFormat) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llmrouter=info"));
+    let json = match format {
+        LogFormat::Json => true,
+        LogFormat::Pretty => false,
+        LogFormat::Auto => !std::io::stdout().is_terminal(),
+    };
+    if json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        let use_color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+        tracing_subscriber::fmt()
+            .with_ansi(use_color)
+            .with_env_filter(filter)
+            .init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    llmrouter::init_crypto();
-
-    let use_color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-    tracing_subscriber::fmt()
-        .with_ansi(use_color)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llmrouter=info")),
-        )
-        .init();
-
-    print_banner();
-
     let cli = Cli::parse();
+    init_logging(cli.log_format);
+    print_banner();
+    llmrouter::init_crypto();
 
     if let Some(ref env_path) = cli.env_file {
         llmrouter::config::Config::load_env_file(env_path)?;
