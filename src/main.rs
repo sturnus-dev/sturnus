@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -29,17 +30,12 @@ struct Cli {
     env_dir: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    llmrouter::init_crypto();
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "llmrouter=info".parse().unwrap()),
-        )
-        .init();
-
+// startup banner, shown only on an interactive terminal so it stays out of structured logs.
+#[allow(clippy::print_stderr)]
+fn print_banner() {
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
     eprintln!(
         "\n\
          \x20     ┌► llm\n\
@@ -48,6 +44,22 @@ async fn main() -> anyhow::Result<()> {
          \x20  llmrouter v{}\n",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    llmrouter::init_crypto();
+
+    let use_color = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    tracing_subscriber::fmt()
+        .with_ansi(use_color)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llmrouter=info")),
+        )
+        .init();
+
+    print_banner();
 
     let cli = Cli::parse();
 
@@ -134,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = async {
         use tokio::signal::unix::{signal, SignalKind};
+        // failing to register SIGTERM at startup is unrecoverable.
+        #[allow(clippy::expect_used)]
         let mut sigterm = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {},

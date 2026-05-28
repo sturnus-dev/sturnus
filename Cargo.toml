@@ -31,6 +31,33 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.rust]
+# No unsafe in this codebase; keep it that way.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Leftover/placeholder code must never ship.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Guard against waste / over-engineering.
+redundant_clone = "warn"
+unnecessary_wraps = "warn"
+needless_pass_by_value = "warn"
+# Force intentional numeric conversions that can corrupt a value.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_lossless = "warn"
+# Discourage silent panics in prod (allowed in tests; see lib.rs).
+unwrap_used = "warn"
+expect_used = "warn"
+# Keep stray output out of structured logs (banner is TTY-gated; see main.rs).
+print_stderr = "warn"
+print_stdout = "warn"
+# Minor hygiene.
+semicolon_if_nothing_returned = "warn"
+manual_let_else = "warn"
+
 [profile.release]
 lto = true
 strip = true

@@ -246,14 +246,11 @@ impl Config {
                     name
                 );
             }
-            let base_url = match p.resolved_base_url() {
-                Some(url) => url,
-                None => {
-                    anyhow::bail!(
-                        "provider '{}' must have base_url or a provider shorthand configured",
-                        name
-                    );
-                }
+            let Some(base_url) = p.resolved_base_url() else {
+                anyhow::bail!(
+                    "provider '{}' must have base_url or a provider shorthand configured",
+                    name
+                );
             };
             if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
                 anyhow::bail!(

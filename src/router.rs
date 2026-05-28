@@ -93,6 +93,8 @@ pub fn select_candidate<'a>(
 
     let healthy: Vec<_> = warm.iter().chain(cold.iter()).copied().collect();
     if explore_ratio > 0.0 && healthy.len() > 1 {
+        // explore_ratio is a 0–1 config; denom is a small positive count.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let denom = (1.0 / explore_ratio).round().max(2.0) as usize;
         if rr.next(alias, denom) == 0 {
             let idx = rr.next_explore(alias, healthy.len());

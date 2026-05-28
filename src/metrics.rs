@@ -1,3 +1,6 @@
+// Metric setup builds static descriptors; an expect failure here is a build-time bug.
+#![allow(clippy::expect_used)]
+
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
