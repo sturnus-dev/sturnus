@@ -401,6 +401,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn test_state_with_upstream(upstream_port: u16) -> Arc<AppState> {
+        crate::init_crypto();
         let config: crate::config::Config = toml::from_str(&format!(
             r#"
 [provider.test]
@@ -608,6 +609,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
     fn proxy_request(
         addr: std::net::SocketAddr,
     ) -> tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>> {
+        crate::init_crypto();
         tokio::spawn(async move {
             reqwest::Client::new()
                 .post(format!("http://{addr}/v1/chat/completions"))
@@ -780,6 +782,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
 
     #[tokio::test]
     async fn affinity_header_pins_to_candidate() {
+        crate::init_crypto();
         // Two distinct upstreams for the same model alias
         let (port_a, handle_a) = instant_upstream(1).await;
         let (port_b, handle_b) = instant_upstream(0).await;

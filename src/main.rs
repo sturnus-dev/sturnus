@@ -31,6 +31,8 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    llmrouter::init_crypto();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -94,10 +96,10 @@ async fn main() -> anyhow::Result<()> {
     let needs_gcp = config
         .provider
         .values()
-        .any(|p| p.resolved_kind() == ProviderKind::GcpMetadata);
+        .any(|p| p.resolved_kind() == ProviderKind::GcpAdc);
     let gcp_token_provider = if needs_gcp {
-        info!("GCP metadata auth enabled");
-        Some(GcpTokenProvider::new(client.clone()))
+        info!("GCP ADC auth enabled");
+        Some(GcpTokenProvider::new())
     } else {
         None
     };

@@ -117,7 +117,7 @@ impl ProviderConfig {
             if self.api_key.is_some() {
                 return ProviderKind::ApiKey;
             }
-            return ProviderKind::GcpMetadata;
+            return ProviderKind::GcpAdc;
         }
         if let Some(ref az) = self.azure_openai {
             return ProviderKind::AzureOpenAi {
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn vertex_ai_defaults_to_gcp_metadata_auth() {
+    fn vertex_ai_defaults_to_gcp_adc_auth() {
         let provider = ProviderConfig {
             vertex_ai: Some(VertexAiConfig {
                 project_id: "p".into(),
@@ -334,7 +334,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert_eq!(provider.resolved_kind(), ProviderKind::GcpMetadata);
+        assert_eq!(provider.resolved_kind(), ProviderKind::GcpAdc);
     }
 
     #[test]

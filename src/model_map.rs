@@ -8,8 +8,8 @@ use std::sync::Arc;
 pub enum ProviderKind {
     /// Bearer token auth. Also used by Google AI Studio.
     ApiKey,
-    /// Access token from GCP metadata server.
-    GcpMetadata,
+    /// Access token via GCP Application Default Credentials.
+    GcpAdc,
     /// api-key header + deployment URL rewriting.
     AzureOpenAi { api_version: String },
     /// x-api-key header + anthropic-version header.

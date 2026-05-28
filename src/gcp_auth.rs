@@ -1,69 +1,67 @@
-use reqwest::Client;
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use gcp_auth::TokenProvider;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::OnceCell;
 use tracing::debug;
 
-const METADATA_URL: &str =
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+/// Vertex AI invocation requires the broad cloud-platform scope.
+const VERTEX_SCOPES: &[&str] = &["https://www.googleapis.com/auth/cloud-platform"];
 
-struct CachedToken {
-    token: String,
-    expires_at: Instant,
-}
+/// Cap on each network step so a stuck endpoint can't hang a request.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Fetches and caches GCP access tokens from the metadata server.
-/// The lock is held through the fetch to coalesce concurrent refreshes.
+/// Resolves GCP access tokens via Application Default Credentials.
+/// Detection runs once on first use; the provider caches and refreshes tokens.
 pub struct GcpTokenProvider {
-    client: Client,
-    cache: Mutex<Option<CachedToken>>,
+    provider: OnceCell<Arc<dyn TokenProvider>>,
 }
 
 impl GcpTokenProvider {
-    pub fn new(client: Client) -> Self {
+    pub fn new() -> Self {
         Self {
-            client,
-            cache: Mutex::new(None),
+            provider: OnceCell::new(),
         }
     }
 
+    async fn provider(
+        &self,
+    ) -> Result<&dyn TokenProvider, Box<dyn std::error::Error + Send + Sync>> {
+        self.provider
+            .get_or_try_init(|| async {
+                debug!("resolving GCP application default credentials");
+                // detection performs network I/O, so it can hang too.
+                match tokio::time::timeout(AUTH_TIMEOUT, gcp_auth::provider()).await {
+                    Ok(result) => Ok(result?),
+                    Err(_) => Err(format!(
+                        "GCP credential detection did not complete within {}s",
+                        AUTH_TIMEOUT.as_secs()
+                    )
+                    .into()),
+                }
+            })
+            .await
+            .map(|p| p.as_ref())
+    }
+
     pub async fn get_token(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cache = self.cache.lock().await;
-
-        if let Some(ref cached) = *cache {
-            if cached.expires_at > Instant::now() + Duration::from_secs(60) {
-                return Ok(cached.token.clone());
+        let provider = self.provider().await?;
+        let fetch = provider.token(VERTEX_SCOPES);
+        let token = match tokio::time::timeout(AUTH_TIMEOUT, fetch).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(format!(
+                    "GCP token request did not complete within {}s",
+                    AUTH_TIMEOUT.as_secs()
+                )
+                .into());
             }
-        }
+        };
+        Ok(token.as_str().to_string())
+    }
+}
 
-        debug!("refreshing GCP access token from metadata server");
-        let resp = self
-            .client
-            .get(METADATA_URL)
-            .header("Metadata-Flavor", "Google")
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("GCP metadata server returned {status}: {body}").into());
-        }
-
-        let body: serde_json::Value = resp.json().await?;
-        let token = body["access_token"]
-            .as_str()
-            .ok_or("missing access_token in metadata response")?
-            .to_string();
-        let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
-
-        let expires_at = Instant::now() + Duration::from_secs(expires_in);
-        debug!(expires_in, "GCP token refreshed");
-
-        *cache = Some(CachedToken {
-            token: token.clone(),
-            expires_at,
-        });
-
-        Ok(token)
+impl Default for GcpTokenProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }

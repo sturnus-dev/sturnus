@@ -75,9 +75,8 @@ pub async fn forward_request(
                 req = req.header("authorization", format!("Bearer {key}"));
             }
         }
-        ProviderKind::GcpMetadata => {
-            let provider =
-                gcp_token_provider.ok_or("gcp_metadata auth requires GCP token provider")?;
+        ProviderKind::GcpAdc => {
+            let provider = gcp_token_provider.ok_or("gcp auth requires GCP token provider")?;
             let token = provider.get_token().await?;
             req = req.header("authorization", format!("Bearer {token}"));
         }
@@ -335,7 +334,7 @@ mod tests {
     #[test]
     fn url_vertex_strips_v1() {
         let c = make_candidate(
-            ProviderKind::GcpMetadata,
+            ProviderKind::GcpAdc,
             "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/p/locations/l/endpoints/openapi",
         );
         let url = build_upstream_url(&c, "/v1/chat/completions");
