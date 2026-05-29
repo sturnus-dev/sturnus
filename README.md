@@ -192,6 +192,27 @@ docker run -v ./config.toml:/config.toml \
   ghcr.io/dannyboland/llmrouter:latest --env-file /secrets/.env
 ```
 
+For Vertex outside GKE (on GKE, workload identity is picked up automatically), supply credentials one of two ways.
+
+A service account key, pointed to by `GOOGLE_APPLICATION_CREDENTIALS` (recommended for production):
+
+```bash
+docker run -v ./config.toml:/config.toml \
+  -v ./sa-key.json:/sa-key.json:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/sa-key.json \
+  -p 4000:4000 \
+  ghcr.io/dannyboland/llmrouter:latest
+```
+
+Or gcloud ADC for local dev, mounted to `$HOME/.config/gcloud/` (the image sets `HOME=/root`):
+
+```bash
+docker run -v ./config.toml:/config.toml \
+  -v ~/.config/gcloud/application_default_credentials.json:/root/.config/gcloud/application_default_credentials.json:ro \
+  -p 4000:4000 \
+  ghcr.io/dannyboland/llmrouter:latest
+```
+
 ## Performance
 
 **~1.3 ms of end-to-end overhead** measured with the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) methodology.
