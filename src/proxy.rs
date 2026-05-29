@@ -98,15 +98,7 @@ pub async fn forward_request(
 
     let status = hyper::StatusCode::from_u16(response.status().as_u16())?;
 
-    let mut headers = hyper::HeaderMap::new();
-    for (k, v) in response.headers() {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
-            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            headers.insert(name, val);
-        }
-    }
+    let headers = sanitize_response_headers(response.headers());
 
     if is_streaming {
         let mut stream = response.bytes_stream();
@@ -205,6 +197,25 @@ where
             }
         }
     })
+}
+
+// Copy upstream headers to the client, dropping Set-Cookie: the upstream's
+// cookies (e.g. Cloudflare's `__cf*` in front of OpenAI) are scoped to its
+// origin, not the proxy's, so clients reject them and warn.
+fn sanitize_response_headers(upstream: &reqwest::header::HeaderMap) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    for (k, v) in upstream {
+        if k == reqwest::header::SET_COOKIE {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            headers.insert(name, val);
+        }
+    }
+    headers
 }
 
 pub fn into_hyper_body(proxy_body: ProxyBody) -> HyperBody {
@@ -356,6 +367,32 @@ mod tests {
         assert_eq!(
             url,
             "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
+        );
+    }
+
+    #[test]
+    fn sanitize_headers_strips_set_cookie_and_keeps_others() {
+        let mut upstream = reqwest::header::HeaderMap::new();
+        upstream.insert("content-type", "application/json".parse().unwrap());
+        upstream.append(
+            reqwest::header::SET_COOKIE,
+            "__cf_bm=abc; path=/; secure".parse().unwrap(),
+        );
+        upstream.append(
+            reqwest::header::SET_COOKIE,
+            "__cfduid=def; path=/".parse().unwrap(),
+        );
+
+        let sanitized = sanitize_response_headers(&upstream);
+
+        assert!(
+            !sanitized.contains_key(reqwest::header::SET_COOKIE),
+            "set-cookie should be stripped"
+        );
+        assert_eq!(
+            sanitized.get("content-type").unwrap(),
+            "application/json",
+            "non-cookie headers should be preserved"
         );
     }
 }
