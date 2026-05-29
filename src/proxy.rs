@@ -98,15 +98,7 @@ pub async fn forward_request(
 
     let status = hyper::StatusCode::from_u16(response.status().as_u16())?;
 
-    let mut headers = hyper::HeaderMap::new();
-    for (k, v) in response.headers() {
-        if let (Ok(name), Ok(val)) = (
-            hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
-            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            headers.insert(name, val);
-        }
-    }
+    let headers = sanitize_response_headers(response.headers());
 
     if is_streaming {
         let mut stream = response.bytes_stream();
@@ -205,6 +197,35 @@ where
             }
         }
     })
+}
+
+// Hop-by-hop (RFC 9110 §7.6.1) plus origin-scoped headers; everything else relays through.
+const STRIP_HEADERS: &[reqwest::header::HeaderName] = &[
+    reqwest::header::CONNECTION,
+    reqwest::header::TRANSFER_ENCODING,
+    reqwest::header::TE,
+    reqwest::header::TRAILER,
+    reqwest::header::UPGRADE,
+    reqwest::header::PROXY_AUTHENTICATE,
+    reqwest::header::PROXY_AUTHORIZATION,
+    reqwest::header::SET_COOKIE,
+    reqwest::header::ALT_SVC,
+];
+
+fn sanitize_response_headers(upstream: &reqwest::header::HeaderMap) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    for (k, v) in upstream {
+        if STRIP_HEADERS.contains(k) || k.as_str().eq_ignore_ascii_case("keep-alive") {
+            continue;
+        }
+        if let (Ok(name), Ok(val)) = (
+            hyper::header::HeaderName::from_bytes(k.as_str().as_bytes()),
+            hyper::header::HeaderValue::from_bytes(v.as_bytes()),
+        ) {
+            headers.append(name, val);
+        }
+    }
+    headers
 }
 
 pub fn into_hyper_body(proxy_body: ProxyBody) -> HyperBody {
@@ -357,5 +378,37 @@ mod tests {
             url,
             "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-21"
         );
+    }
+
+    #[test]
+    fn sanitize_headers_strips_unsafe_and_preserves_rest() {
+        let mut upstream = reqwest::header::HeaderMap::new();
+        upstream.insert("content-type", "application/json".parse().unwrap());
+        upstream.insert(
+            reqwest::header::TRANSFER_ENCODING,
+            "chunked".parse().unwrap(),
+        );
+        upstream.insert(reqwest::header::CONNECTION, "keep-alive".parse().unwrap());
+        upstream.insert(reqwest::header::ALT_SVC, "h3=\":443\"".parse().unwrap());
+        upstream.append(reqwest::header::SET_COOKIE, "__cf_bm=abc".parse().unwrap());
+        upstream.append(reqwest::header::SET_COOKIE, "__cfduid=def".parse().unwrap());
+        upstream.append(reqwest::header::VARY, "accept".parse().unwrap());
+        upstream.append(reqwest::header::VARY, "origin".parse().unwrap());
+
+        let sanitized = sanitize_response_headers(&upstream);
+
+        for stripped in [
+            reqwest::header::SET_COOKIE,
+            reqwest::header::TRANSFER_ENCODING,
+            reqwest::header::CONNECTION,
+            reqwest::header::ALT_SVC,
+        ] {
+            assert!(
+                !sanitized.contains_key(&stripped),
+                "{stripped} should be stripped"
+            );
+        }
+        assert_eq!(sanitized.get("content-type").unwrap(), "application/json");
+        assert_eq!(sanitized.get_all(reqwest::header::VARY).iter().count(), 2);
     }
 }
