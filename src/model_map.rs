@@ -1,6 +1,6 @@
 use crate::config::{Config, ModelCandidate};
 use crate::tracker::Tracker;
-use http::HeaderValue;
+use hyper::header::HeaderValue;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 

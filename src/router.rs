@@ -122,8 +122,9 @@ mod tests {
             api_key: None,
             kind: ProviderKind::ApiKey,
             stats_index,
-            provider_header: http::HeaderValue::from_str(provider).unwrap(),
-            affinity_header: http::HeaderValue::try_from(format!("{provider}/{model}")).unwrap(),
+            provider_header: hyper::header::HeaderValue::from_str(provider).unwrap(),
+            affinity_header: hyper::header::HeaderValue::try_from(format!("{provider}/{model}"))
+                .unwrap(),
             attribution_labels: None,
         }
     }

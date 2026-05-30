@@ -7,6 +7,7 @@ pub mod model_map;
 pub mod proxy;
 pub mod router;
 pub mod server;
+pub mod trace;
 pub mod tracker;
 
 /// Install ring as the process-wide rustls crypto provider. Idempotent.

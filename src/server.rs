@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::gcp_auth::GcpTokenProvider;
 use crate::metrics::Metrics;
@@ -321,7 +321,8 @@ pub async fn run_server(
                 let conn = http1::Builder::new()
                     .serve_connection(io, service_fn(move |req| {
                         let state = state.clone();
-                        async move { handle_request(req, state).await }
+                        let span = crate::trace::request_span(req.headers());
+                        handle_request(req, state).instrument(span)
                     }));
 
                 let conn = graceful.watch(conn);

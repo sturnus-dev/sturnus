@@ -69,6 +69,8 @@ fn init_logging(format: LogFormat) {
     if json {
         tracing_subscriber::fmt()
             .json()
+            // One request span only; the span list would just duplicate it.
+            .with_span_list(false)
             .with_env_filter(filter)
             .init();
     } else {

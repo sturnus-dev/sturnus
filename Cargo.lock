@@ -803,7 +803,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "llmrouter"
-version = "3.4.2"
+version = "3.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -811,8 +811,6 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "gcp_auth",
- "http",
- "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",

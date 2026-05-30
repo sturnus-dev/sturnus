@@ -339,8 +339,8 @@ mod tests {
             api_key: Some("test-key".into()),
             kind,
             stats_index: 0,
-            provider_header: http::HeaderValue::from_static("test"),
-            affinity_header: http::HeaderValue::from_static("test/gpt-4o"),
+            provider_header: hyper::header::HeaderValue::from_static("test"),
+            affinity_header: hyper::header::HeaderValue::from_static("test/gpt-4o"),
             attribution_labels: None,
         }
     }
