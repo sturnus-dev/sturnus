@@ -227,14 +227,29 @@ pub async fn handle_request(
 
     match result {
         Ok(proxy_result) => {
-            if proxy_result.status.is_success() {
+            let status = proxy_result.status;
+            if status.is_success() {
                 state.tracker.record_ttfc(stats_index, proxy_result.ttfc);
                 state.tracker.record_success(stats_index);
+                debug!(
+                    provider = %provider,
+                    model = %model,
+                    status = %status,
+                    ttfc_ms = proxy_result.ttfc.as_millis(),
+                    "response received"
+                );
             } else {
+                warn!(
+                    provider = %provider,
+                    model = %model,
+                    status = %status,
+                    ttfc_ms = proxy_result.ttfc.as_millis(),
+                    "upstream returned error status"
+                );
                 state.tracker.record_error(stats_index);
             }
 
-            let status_str = proxy_result.status.as_u16().to_string();
+            let status_str = status.as_u16().to_string();
             state
                 .metrics
                 .requests_total
@@ -245,14 +260,6 @@ pub async fn handle_request(
                 .ttfc_seconds
                 .with_label_values(&[alias.as_str(), provider, model])
                 .observe(proxy_result.ttfc.as_secs_f64());
-
-            debug!(
-                provider = %provider,
-                model = %model,
-                status = %proxy_result.status,
-                ttfc_ms = proxy_result.ttfc.as_millis(),
-                "response received"
-            );
 
             let body = proxy::into_hyper_body(proxy_result.body);
             let mut resp = Response::new(body);
@@ -894,6 +901,29 @@ fast = [
             .to_str()
             .unwrap();
         assert_eq!(affinity, "test/test-model");
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_error_status_relayed_and_metered() {
+        let (mock_port, mock_handle) = failing_upstream("503 Service Unavailable").await;
+        let state = test_state_with_upstream(mock_port);
+        let (addr, _tx, _server) = start_server(state.clone());
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+
+        let metrics = String::from_utf8(state.metrics.encode().unwrap()).unwrap();
+        assert!(
+            metrics.contains("status_code=\"503\""),
+            "expected requests_total to carry the upstream status: {metrics}"
+        );
 
         mock_handle.abort();
     }

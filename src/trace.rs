@@ -40,15 +40,19 @@ fn is_all_zero(s: &str) -> bool {
 }
 
 pub fn request_span(headers: &hyper::HeaderMap) -> tracing::Span {
+    let request_id = uuid::Uuid::new_v4();
     match headers
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .and_then(parse_traceparent)
     {
-        Some(ctx) => {
-            tracing::info_span!("request", trace_id = %ctx.trace_id, parent_span_id = %ctx.parent_span_id)
-        }
-        None => tracing::info_span!("request"),
+        Some(ctx) => tracing::info_span!(
+            "request",
+            %request_id,
+            trace_id = %ctx.trace_id,
+            parent_span_id = %ctx.parent_span_id
+        ),
+        None => tracing::info_span!("request", %request_id),
     }
 }
 

@@ -24,6 +24,7 @@ shellexpand = { version = "3", default-features = false, features = ["base-0"] }
 dotenvy = "0.15"
 prometheus = { version = "0.14", default-features = false }
 gcp_auth = "0.12"
+uuid = { version = "1", features = ["v4"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [dev-dependencies]

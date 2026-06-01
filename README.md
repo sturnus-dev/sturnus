@@ -140,11 +140,31 @@ llmrouter --env-file /secrets/.env
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
 | GET | `/status` | Returns current EWMA, error rate, and status per candidate |
-| GET | `/metrics` | Prometheus metrics (request counts, TTFC histogram, errors) |
+| GET | `/metrics` | Prometheus metrics (see below) |
 
-## Logging
+## Observability
+
+### Metrics
+
+Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `llmrouter_requests_total` | counter | Completed responses, additionally labelled by `status_code` (includes upstream 4xx/5xx) |
+| `llmrouter_ttfc_seconds` | histogram | Time to first chunk, recorded for successful responses |
+| `llmrouter_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
+
+Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".
+
+### Logging
 
 Structured logging via `tracing`: human-readable and coloured on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Override with `--log-format <auto|pretty|json>` or `LLMROUTER_LOG_FORMAT`; filter with `RUST_LOG` (default `llmrouter=info`).
+
+Every request is wrapped in a span carrying a `request_id` that correlates all log lines for that request; when the client sends a W3C `traceparent`, the `trace_id` and `parent_span_id` are attached too. Notable events at the default `info` level and above:
+
+- **Upstream error status** (`warn`) — an upstream answered 4xx/5xx; relayed to the client verbatim and logged with the status.
+- **Upstream request failed** (`warn`) — the request never reached the upstream (transport error); returned to the client as `502`.
+- **Stream chunk error** (`warn`) — a streamed response broke partway through.
 
 ## Session affinity
 
