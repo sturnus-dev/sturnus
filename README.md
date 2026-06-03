@@ -139,7 +139,7 @@ llmrouter --env-file /secrets/.env
 | POST | `/v1/chat/completions` | Proxied to upstream (model alias resolved) |
 | POST | `/v1/embeddings` | Proxied to upstream (model alias resolved) |
 | GET | `/health` | Returns `{"status":"ok"}` |
-| GET | `/status` | Returns current EWMA, error rate, and status per candidate |
+| GET | `/status` | Returns current streaming/non-streaming EWMAs, error rate, and status per candidate |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
 ## Observability
@@ -151,7 +151,8 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 | Metric | Type | Meaning |
 |--------|------|---------|
 | `llmrouter_requests_total` | counter | Completed responses, additionally labelled by `status_code` (includes upstream 4xx/5xx) |
-| `llmrouter_ttfc_seconds` | histogram | Time to first chunk, recorded for successful responses |
+| `llmrouter_ttfc_seconds` | histogram | Streaming time-to-first-chunk (streaming requests only) |
+| `llmrouter_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
 | `llmrouter_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
 
 Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".

@@ -18,9 +18,9 @@ use tracing::{debug, error, info, warn, Instrument};
 use crate::gcp_auth::GcpTokenProvider;
 use crate::metrics::Metrics;
 use crate::model_map::ModelMap;
-use crate::proxy;
+use crate::proxy::{self, UpstreamLatency};
 use crate::router::{self, RoundRobinState};
-use crate::tracker::Tracker;
+use crate::tracker::{LatencyMode, Tracker};
 
 pub struct AppState {
     pub model_map: ModelMap,
@@ -177,6 +177,17 @@ pub async fn handle_request(
         }
     });
 
+    // Needed before routing: mode selects which EWMA the router compares.
+    let is_streaming = body_map
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let latency_mode = if is_streaming {
+        LatencyMode::Streaming
+    } else {
+        LatencyMode::NonStreaming
+    };
+
     let candidate = if let Some(c) = pinned {
         c
     } else {
@@ -186,6 +197,7 @@ pub async fn handle_request(
             &state.tracker,
             &state.rr_state,
             state.explore_ratio,
+            latency_mode,
         ) {
             Some(c) => c,
             None => {
@@ -198,11 +210,6 @@ pub async fn handle_request(
     };
 
     let stats_index = candidate.stats_index;
-
-    let is_streaming = body_map
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     info!(
         alias = %alias,
@@ -228,14 +235,28 @@ pub async fn handle_request(
     match result {
         Ok(proxy_result) => {
             let status = proxy_result.status;
+
+            // Variant carries what was measured, so mode, metric and duration agree.
+            let (observed_mode, latency, latency_metric) = match proxy_result.latency {
+                UpstreamLatency::Ttfc(d) => {
+                    (LatencyMode::Streaming, d, &state.metrics.ttfc_seconds)
+                }
+                UpstreamLatency::Total(d) => {
+                    (LatencyMode::NonStreaming, d, &state.metrics.latency_seconds)
+                }
+            };
+
             if status.is_success() {
-                state.tracker.record_ttfc(stats_index, proxy_result.ttfc);
+                state
+                    .tracker
+                    .record_latency(stats_index, observed_mode, latency);
                 state.tracker.record_success(stats_index);
                 debug!(
                     provider = %provider,
                     model = %model,
                     status = %status,
-                    ttfc_ms = proxy_result.ttfc.as_millis(),
+                    mode = observed_mode.as_str(),
+                    latency_ms = latency.as_millis(),
                     "response received"
                 );
             } else {
@@ -243,7 +264,8 @@ pub async fn handle_request(
                     provider = %provider,
                     model = %model,
                     status = %status,
-                    ttfc_ms = proxy_result.ttfc.as_millis(),
+                    mode = observed_mode.as_str(),
+                    latency_ms = latency.as_millis(),
                     "upstream returned error status"
                 );
                 state.tracker.record_error(stats_index);
@@ -255,11 +277,9 @@ pub async fn handle_request(
                 .requests_total
                 .with_label_values(&[alias.as_str(), provider, model, status_str.as_str()])
                 .inc();
-            state
-                .metrics
-                .ttfc_seconds
+            latency_metric
                 .with_label_values(&[alias.as_str(), provider, model])
-                .observe(proxy_result.ttfc.as_secs_f64());
+                .observe(latency.as_secs_f64());
 
             let body = proxy::into_hyper_body(proxy_result.body);
             let mut resp = Response::new(body);
@@ -372,9 +392,11 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
             continue;
         }
         let stats = state.tracker.stats(c.stats_index);
-        let ewma = stats.ewma_ms.load(Ordering::Relaxed);
+        let streaming_ewma = stats.ewma_ms(LatencyMode::Streaming);
+        let nonstreaming_ewma = stats.ewma_ms(LatencyMode::NonStreaming);
         let degraded = state.tracker.is_degraded(c.stats_index);
-        let status = if ewma == u64::MAX {
+        let any_warm = streaming_ewma != u64::MAX || nonstreaming_ewma != u64::MAX;
+        let status = if !any_warm {
             "cold"
         } else if degraded {
             "degraded"
@@ -386,7 +408,8 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
             "provider": c.provider_name,
             "model": c.model,
             "status": status,
-            "ewma_ms": if ewma == u64::MAX { None } else { Some(ewma) },
+            "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
+            "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
             "error_rate": stats.error_rate(),
         }));
     }
@@ -483,6 +506,11 @@ fast = [{{ provider = "test", model = "test-model" }}]
             .observe(0.1);
         state
             .metrics
+            .latency_seconds
+            .with_label_values(&["fast", "test", "test-model"])
+            .observe(0.2);
+        state
+            .metrics
             .errors_total
             .with_label_values(&["fast", "test", "test-model"])
             .inc();
@@ -517,6 +545,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
         let body = resp.text().await.unwrap();
         assert!(body.contains("llmrouter_requests_total"));
         assert!(body.contains("llmrouter_ttfc_seconds"));
+        assert!(body.contains("llmrouter_latency_seconds"));
         assert!(body.contains("llmrouter_errors_total"));
     }
 
@@ -823,8 +852,8 @@ fast = [
         }
 
         // Make beta look fast (10ms) and alpha slow (500ms) so the router
-        // naturally prefers beta. We then pin affinity to alpha and verify
-        // the router honours the pin instead of picking beta.
+        // naturally prefers beta, then pin to alpha and verify the pin wins.
+        // The request is non-streaming, so seed that EWMA.
         let fast_candidates = model_map.get("fast").unwrap();
         let alpha_idx = fast_candidates
             .iter()
@@ -836,9 +865,17 @@ fast = [
             .find(|c| c.provider_name == "beta")
             .unwrap()
             .stats_index;
-        tracker.record_ttfc(alpha_idx, Duration::from_millis(500));
+        tracker.record_latency(
+            alpha_idx,
+            LatencyMode::NonStreaming,
+            Duration::from_millis(500),
+        );
         tracker.record_success(alpha_idx);
-        tracker.record_ttfc(beta_idx, Duration::from_millis(10));
+        tracker.record_latency(
+            beta_idx,
+            LatencyMode::NonStreaming,
+            Duration::from_millis(10),
+        );
         tracker.record_success(beta_idx);
 
         let state = Arc::new(AppState {
@@ -941,13 +978,11 @@ fast = [
             .unwrap()
             .stats_index;
 
-        assert_eq!(
+        assert!(
             state
                 .tracker
                 .stats(stats_index)
-                .ewma_ms
-                .load(Ordering::Relaxed),
-            u64::MAX,
+                .is_cold(LatencyMode::NonStreaming),
             "precondition: EWMA should start uninitialized"
         );
 
@@ -960,13 +995,11 @@ fast = [
             .unwrap();
         assert_eq!(resp.status(), 401);
 
-        assert_eq!(
+        assert!(
             state
                 .tracker
                 .stats(stats_index)
-                .ewma_ms
-                .load(Ordering::Relaxed),
-            u64::MAX,
+                .is_cold(LatencyMode::NonStreaming),
             "fast 4xx responses must not pollute EWMA latency stats"
         );
 

@@ -8,7 +8,10 @@ use prometheus::{
 pub struct Metrics {
     registry: Registry,
     pub requests_total: IntCounterVec,
+    /// Streaming time-to-first-chunk.
     pub ttfc_seconds: HistogramVec,
+    /// Non-streaming full response time.
+    pub latency_seconds: HistogramVec,
     pub errors_total: IntCounterVec,
 }
 
@@ -34,12 +37,25 @@ impl Metrics {
         )
         .expect("valid metric descriptor");
 
+        // Distinct metrics, not one with a mode label: they measure different things.
+        let latency_buckets = vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
+
         let ttfc_seconds = HistogramVec::new(
             HistogramOpts::new(
                 "llmrouter_ttfc_seconds",
-                "Time to first chunk from upstream",
+                "Streaming time-to-first-chunk from upstream",
             )
-            .buckets(vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]),
+            .buckets(latency_buckets.clone()),
+            &["alias", "provider", "model"],
+        )
+        .expect("valid metric descriptor");
+
+        let latency_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "llmrouter_latency_seconds",
+                "Non-streaming full response time from upstream",
+            )
+            .buckets(latency_buckets),
             &["alias", "provider", "model"],
         )
         .expect("valid metric descriptor");
@@ -60,6 +76,9 @@ impl Metrics {
             .register(Box::new(ttfc_seconds.clone()))
             .expect("unique metric name");
         registry
+            .register(Box::new(latency_seconds.clone()))
+            .expect("unique metric name");
+        registry
             .register(Box::new(errors_total.clone()))
             .expect("unique metric name");
 
@@ -67,6 +86,7 @@ impl Metrics {
             registry,
             requests_total,
             ttfc_seconds,
+            latency_seconds,
             errors_total,
         }
     }
@@ -101,6 +121,9 @@ mod tests {
         m.ttfc_seconds
             .with_label_values(&["fast", "openai", "gpt-4o-mini"])
             .observe(0.42);
+        m.latency_seconds
+            .with_label_values(&["fast", "openai", "gpt-4o-mini"])
+            .observe(1.5);
         m.errors_total
             .with_label_values(&["fast", "groq", "llama-3"])
             .inc();
@@ -108,6 +131,7 @@ mod tests {
         let output = String::from_utf8(m.encode().unwrap()).unwrap();
         assert!(output.contains("llmrouter_requests_total"));
         assert!(output.contains("llmrouter_ttfc_seconds"));
+        assert!(output.contains("llmrouter_latency_seconds"));
         assert!(output.contains("llmrouter_errors_total"));
         assert!(output.contains("alias=\"fast\""));
         assert!(output.contains("provider=\"openai\""));

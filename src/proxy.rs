@@ -17,11 +17,19 @@ pub type HyperBody = http_body_util::Either<
     StreamBody<futures_util::stream::BoxStream<'static, Result<Frame<Bytes>, Infallible>>>,
 >;
 
+/// Upstream latency tagged with what was measured: TTFC for streaming,
+/// full response time for non-streaming.
+#[derive(Debug, Clone, Copy)]
+pub enum UpstreamLatency {
+    Ttfc(std::time::Duration),
+    Total(std::time::Duration),
+}
+
 pub struct ProxyResult {
     pub status: hyper::StatusCode,
     pub headers: hyper::HeaderMap,
     pub body: ProxyBody,
-    pub ttfc: std::time::Duration,
+    pub latency: UpstreamLatency,
 }
 
 pub enum ProxyBody {
@@ -126,17 +134,17 @@ pub async fn forward_request(
             status,
             headers,
             body: ProxyBody::Streaming(Box::pin(combined)),
-            ttfc,
+            latency: UpstreamLatency::Ttfc(ttfc),
         })
     } else {
         let full_body = response.bytes().await?;
-        let ttfc = t0.elapsed();
+        let total = t0.elapsed();
 
         Ok(ProxyResult {
             status,
             headers,
             body: ProxyBody::Full(full_body),
-            ttfc,
+            latency: UpstreamLatency::Total(total),
         })
     }
 }

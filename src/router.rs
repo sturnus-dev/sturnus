@@ -1,5 +1,5 @@
 use crate::model_map::ResolvedCandidate;
-use crate::tracker::Tracker;
+use crate::tracker::{LatencyMode, Tracker};
 use std::sync::atomic::Ordering;
 
 /// Separate route/explore counters per alias to avoid counter drift when
@@ -52,15 +52,17 @@ impl RoundRobinState {
 
 /// Pick the best candidate for the given alias.
 ///
-/// Candidates are bucketed into warm (have EWMA data), cold (no data yet),
-/// and degraded (high error rate). `explore_ratio` controls the fraction of
-/// requests that round-robin across warm+cold to discover or re-probe candidates.
+/// Candidates are bucketed into warm (have EWMA data for `mode`), cold (no
+/// data yet), and degraded (high error rate). `explore_ratio` controls the
+/// fraction of requests that round-robin across warm+cold to discover or
+/// re-probe candidates.
 pub fn select_candidate<'a>(
     alias: &str,
     candidates: &'a [ResolvedCandidate],
     tracker: &Tracker,
     rr: &RoundRobinState,
     explore_ratio: f64,
+    mode: LatencyMode,
 ) -> Option<&'a ResolvedCandidate> {
     if candidates.is_empty() {
         return None;
@@ -75,7 +77,7 @@ pub fn select_candidate<'a>(
         let stats = tracker.stats(c.stats_index);
         if tracker.is_degraded(c.stats_index) {
             degraded.push(item);
-        } else if stats.is_cold() {
+        } else if stats.is_cold(mode) {
             cold.push(item);
         } else {
             warm.push(item);
@@ -103,7 +105,7 @@ pub fn select_candidate<'a>(
     }
 
     warm.iter()
-        .min_by_key(|(_, c)| tracker.stats(c.stats_index).ewma_ms.load(Ordering::Relaxed))
+        .min_by_key(|(_, c)| tracker.stats(c.stats_index).ewma_ms(mode))
         .map(|(_, c)| *c)
 }
 
@@ -147,15 +149,39 @@ mod tests {
     fn empty_candidates_returns_none() {
         let candidates: Vec<ResolvedCandidate> = vec![];
         let (_, tracker, rr) = setup(&[]);
-        assert!(select_candidate("test", &candidates, &tracker, &rr, 0.2).is_none());
+        assert!(select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.2,
+            LatencyMode::Streaming
+        )
+        .is_none());
     }
 
     #[test]
     fn all_cold_round_robins() {
         let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
 
-        let first = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
-        let second = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
+        let first = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.2,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+        let second = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.2,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
         assert_ne!(first.provider_name, second.provider_name);
     }
 
@@ -163,11 +189,27 @@ mod tests {
     fn picks_lowest_ewma() {
         let (candidates, tracker, rr) = setup(&[("slow", "m1"), ("fast", "m2")]);
 
-        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(500));
-        tracker.record_ttfc(candidates[1].stats_index, Duration::from_millis(100));
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(500),
+        );
+        tracker.record_latency(
+            candidates[1].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
 
         for _ in 0..10 {
-            let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
+            let picked = select_candidate(
+                "test",
+                &candidates,
+                &tracker,
+                &rr,
+                0.0,
+                LatencyMode::Streaming,
+            )
+            .unwrap();
             assert_eq!(picked.provider_name, "fast");
         }
     }
@@ -176,8 +218,16 @@ mod tests {
     fn degraded_candidate_goes_to_explore() {
         let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
 
-        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(200));
-        tracker.record_ttfc(candidates[1].stats_index, Duration::from_millis(50));
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(200),
+        );
+        tracker.record_latency(
+            candidates[1].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(50),
+        );
 
         for _ in 0..10 {
             tracker.record_error(candidates[1].stats_index);
@@ -185,7 +235,15 @@ mod tests {
         assert!(tracker.is_degraded(candidates[1].stats_index));
 
         for _ in 0..20 {
-            let picked = select_candidate("test", &candidates, &tracker, &rr, 0.2).unwrap();
+            let picked = select_candidate(
+                "test",
+                &candidates,
+                &tracker,
+                &rr,
+                0.2,
+                LatencyMode::Streaming,
+            )
+            .unwrap();
             assert_eq!(picked.provider_name, "good");
         }
     }
@@ -194,13 +252,25 @@ mod tests {
     fn explore_ratio_sends_traffic_to_cold() {
         let (candidates, tracker, rr) = setup(&[("warm", "m1"), ("cold", "m2")]);
 
-        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(100));
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
 
         // With explore_ratio=0.5, roughly half should go to the cold candidate
         let mut cold_picks = 0;
         let n = 100;
         for _ in 0..n {
-            let picked = select_candidate("test", &candidates, &tracker, &rr, 0.5).unwrap();
+            let picked = select_candidate(
+                "test",
+                &candidates,
+                &tracker,
+                &rr,
+                0.5,
+                LatencyMode::Streaming,
+            )
+            .unwrap();
             if picked.provider_name == "cold" {
                 cold_picks += 1;
             }
@@ -219,17 +289,45 @@ mod tests {
     fn traffic_shifts_when_latency_increases() {
         let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
 
-        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(100));
-        tracker.record_ttfc(candidates[1].stats_index, Duration::from_millis(300));
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
+        tracker.record_latency(
+            candidates[1].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(300),
+        );
 
-        let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
+        let picked = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.0,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
         assert_eq!(picked.provider_name, "a");
 
         for _ in 0..20 {
-            tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(500));
+            tracker.record_latency(
+                candidates[0].stats_index,
+                LatencyMode::Streaming,
+                Duration::from_millis(500),
+            );
         }
 
-        let picked = select_candidate("test", &candidates, &tracker, &rr, 0.0).unwrap();
+        let picked = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.0,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
         assert_eq!(picked.provider_name, "b");
     }
 
@@ -237,19 +335,82 @@ mod tests {
     fn cold_candidate_with_errors_is_degraded_not_explored() {
         let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
 
-        tracker.record_ttfc(candidates[0].stats_index, Duration::from_millis(100));
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(100),
+        );
 
         for _ in 0..10 {
             tracker.record_error(candidates[1].stats_index);
         }
 
         // Cold (no EWMA) but degraded takes priority
-        assert!(tracker.stats(candidates[1].stats_index).is_cold());
+        assert!(tracker
+            .stats(candidates[1].stats_index)
+            .is_cold(LatencyMode::Streaming));
         assert!(tracker.is_degraded(candidates[1].stats_index));
 
         for _ in 0..20 {
-            let picked = select_candidate("test", &candidates, &tracker, &rr, 0.5).unwrap();
+            let picked = select_candidate(
+                "test",
+                &candidates,
+                &tracker,
+                &rr,
+                0.5,
+                LatencyMode::Streaming,
+            )
+            .unwrap();
             assert_eq!(picked.provider_name, "good");
         }
+    }
+
+    #[test]
+    fn nonstreaming_routing_ignores_streaming_ewma() {
+        let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
+
+        // a fast on streaming, slow on non-streaming; b the reverse.
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(50),
+        );
+        tracker.record_latency(
+            candidates[0].stats_index,
+            LatencyMode::NonStreaming,
+            Duration::from_millis(5_000),
+        );
+        tracker.record_latency(
+            candidates[1].stats_index,
+            LatencyMode::Streaming,
+            Duration::from_millis(5_000),
+        );
+        tracker.record_latency(
+            candidates[1].stats_index,
+            LatencyMode::NonStreaming,
+            Duration::from_millis(50),
+        );
+
+        let streaming_pick = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.0,
+            LatencyMode::Streaming,
+        )
+        .unwrap();
+        assert_eq!(streaming_pick.provider_name, "a");
+
+        let nonstreaming_pick = select_candidate(
+            "test",
+            &candidates,
+            &tracker,
+            &rr,
+            0.0,
+            LatencyMode::NonStreaming,
+        )
+        .unwrap();
+        assert_eq!(nonstreaming_pick.provider_name, "b");
     }
 }

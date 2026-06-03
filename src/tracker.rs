@@ -51,17 +51,37 @@ impl ErrorWindow {
     }
 }
 
+/// Streaming TTFC and non-streaming response time are tracked separately;
+/// blending them in one EWMA would distort routing for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LatencyMode {
+    Streaming,
+    NonStreaming,
+}
+
+impl LatencyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LatencyMode::Streaming => "streaming",
+            LatencyMode::NonStreaming => "nonstreaming",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CandidateStats {
-    /// EWMA of TTFC in milliseconds. u64::MAX = cold (no data).
-    pub ewma_ms: AtomicU64,
+    /// EWMA of streaming TTFC in milliseconds. u64::MAX = cold (no data).
+    streaming_ewma_ms: AtomicU64,
+    /// EWMA of non-streaming response time in milliseconds. u64::MAX = cold.
+    nonstreaming_ewma_ms: AtomicU64,
     error_window: Mutex<ErrorWindow>,
 }
 
 impl CandidateStats {
     pub fn new(error_window_duration: Duration, max_error_window_entries: usize) -> Self {
         Self {
-            ewma_ms: AtomicU64::new(u64::MAX),
+            streaming_ewma_ms: AtomicU64::new(u64::MAX),
+            nonstreaming_ewma_ms: AtomicU64::new(u64::MAX),
             error_window: Mutex::new(ErrorWindow::new(
                 error_window_duration,
                 max_error_window_entries,
@@ -75,8 +95,19 @@ impl CandidateStats {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn is_cold(&self) -> bool {
-        self.ewma_ms.load(Ordering::Relaxed) == u64::MAX
+    fn ewma_field(&self, mode: LatencyMode) -> &AtomicU64 {
+        match mode {
+            LatencyMode::Streaming => &self.streaming_ewma_ms,
+            LatencyMode::NonStreaming => &self.nonstreaming_ewma_ms,
+        }
+    }
+
+    pub fn ewma_ms(&self, mode: LatencyMode) -> u64 {
+        self.ewma_field(mode).load(Ordering::Relaxed)
+    }
+
+    pub fn is_cold(&self, mode: LatencyMode) -> bool {
+        self.ewma_ms(mode) == u64::MAX
     }
 
     pub fn error_rate(&self) -> f64 {
@@ -91,9 +122,10 @@ impl CandidateStats {
         self.lock_window().record(false);
     }
 
-    pub fn update_ewma(&self, observed_ms: u64, alpha: f64) {
+    pub fn update_ewma(&self, mode: LatencyMode, observed_ms: u64, alpha: f64) {
+        let field = self.ewma_field(mode);
         loop {
-            let old = self.ewma_ms.load(Ordering::Relaxed);
+            let old = field.load(Ordering::Relaxed);
             // EWMA of positive millis; rounds to a bounded non-negative u64.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let new_val = if old == u64::MAX {
@@ -102,12 +134,7 @@ impl CandidateStats {
                 let new_f = alpha * observed_ms as f64 + (1.0 - alpha) * old as f64;
                 new_f.round() as u64
             };
-            match self.ewma_ms.compare_exchange_weak(
-                old,
-                new_val,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match field.compare_exchange_weak(old, new_val, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => break,
                 Err(_) => continue, // another thread updated; retry with fresh value
             }
@@ -160,11 +187,11 @@ impl Tracker {
         &self.stats[index]
     }
 
-    pub fn record_ttfc(&self, index: usize, ttfc: Duration) {
+    pub fn record_latency(&self, index: usize, mode: LatencyMode, observed: Duration) {
         // request latency in millis always fits u64.
         #[allow(clippy::cast_possible_truncation)]
-        let ms = ttfc.as_millis() as u64;
-        self.stats[index].update_ewma(ms, self.alpha);
+        let ms = observed.as_millis() as u64;
+        self.stats[index].update_ewma(mode, ms, self.alpha);
     }
 
     pub fn record_success(&self, index: usize) {
@@ -187,27 +214,39 @@ mod tests {
     #[test]
     fn ewma_first_observation_sets_directly() {
         let stats = CandidateStats::new(Duration::from_secs(30), 10_000);
-        assert!(stats.is_cold());
-        stats.update_ewma(100, 0.3);
-        assert_eq!(stats.ewma_ms.load(Ordering::Relaxed), 100);
-        assert!(!stats.is_cold());
+        assert!(stats.is_cold(LatencyMode::Streaming));
+        stats.update_ewma(LatencyMode::Streaming, 100, 0.3);
+        assert_eq!(stats.ewma_ms(LatencyMode::Streaming), 100);
+        assert!(!stats.is_cold(LatencyMode::Streaming));
     }
 
     #[test]
     fn ewma_blends_subsequent_observations() {
         let stats = CandidateStats::new(Duration::from_secs(30), 10_000);
-        stats.update_ewma(100, 0.3);
-        stats.update_ewma(200, 0.3);
-        assert_eq!(stats.ewma_ms.load(Ordering::Relaxed), 130);
+        stats.update_ewma(LatencyMode::Streaming, 100, 0.3);
+        stats.update_ewma(LatencyMode::Streaming, 200, 0.3);
+        assert_eq!(stats.ewma_ms(LatencyMode::Streaming), 130);
     }
 
     #[test]
     fn ewma_converges_toward_constant_signal() {
         let stats = CandidateStats::new(Duration::from_secs(30), 10_000);
         for _ in 0..50 {
-            stats.update_ewma(500, 0.3);
+            stats.update_ewma(LatencyMode::Streaming, 500, 0.3);
         }
-        assert_eq!(stats.ewma_ms.load(Ordering::Relaxed), 500);
+        assert_eq!(stats.ewma_ms(LatencyMode::Streaming), 500);
+    }
+
+    #[test]
+    fn streaming_and_nonstreaming_ewmas_are_independent() {
+        let stats = CandidateStats::new(Duration::from_secs(30), 10_000);
+        stats.update_ewma(LatencyMode::Streaming, 100, 0.3);
+        assert_eq!(stats.ewma_ms(LatencyMode::Streaming), 100);
+        assert!(stats.is_cold(LatencyMode::NonStreaming));
+
+        stats.update_ewma(LatencyMode::NonStreaming, 5_000, 0.3);
+        assert_eq!(stats.ewma_ms(LatencyMode::Streaming), 100);
+        assert_eq!(stats.ewma_ms(LatencyMode::NonStreaming), 5_000);
     }
 
     #[test]
@@ -308,12 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn record_ttfc_updates_ewma() {
+    fn record_latency_updates_ewma_for_correct_mode() {
         let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
         let idx = tracker.register();
-        tracker.record_ttfc(idx, Duration::from_millis(150));
-        let ewma = tracker.stats(idx).ewma_ms.load(Ordering::Relaxed);
-        assert_eq!(ewma, 150);
+        tracker.record_latency(idx, LatencyMode::Streaming, Duration::from_millis(150));
+        assert_eq!(tracker.stats(idx).ewma_ms(LatencyMode::Streaming), 150);
+        assert!(tracker.stats(idx).is_cold(LatencyMode::NonStreaming));
     }
 
     #[test]
