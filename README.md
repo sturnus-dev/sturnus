@@ -4,9 +4,9 @@
 [![GitHub Release](https://img.shields.io/github/v/release/dannyboland/llmrouter)](https://github.com/dannyboland/llmrouter/releases)
 [![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fdannyboland%2Fllmrouter-blue?logo=docker)](https://ghcr.io/dannyboland/llmrouter)
 
-**Automatic latency-based routing across LLM providers. ~1 ms overhead. Zero infrastructure.**
+**Automatic latency-based routing across LLM providers. ~1.3 ms overhead. Zero infrastructure.**
 
-LLM providers have variable latency and availability that can break production features. llmrouter is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest right now.
+LLM providers have variable latency and availability that can break production features. llmrouter is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
 
 ## Features
 
@@ -17,6 +17,24 @@ LLM providers have variable latency and availability that can break production f
 - **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive with no buffering
 - **Vertex AI support** — GKE Workload Identity auth via metadata server with automatic token refresh
 - **Zero infrastructure** — single static binary, no Redis/database/control plane
+
+## Why llmrouter
+
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. llmrouter is deliberately the opposite:
+
+- **A single static binary, not a platform.** A Rust codebase you can read in an afternoon. No database, no Redis, no control plane, no background services — it runs as a standalone sidecar next to your app.
+- **Small, auditable surface area.** It does one thing — latency-aware routing across providers you configure — with a tight dependency list and a smaller attack surface.
+- **Free and self-hosted.** MIT-licensed and runs entirely inside your infrastructure.
+- **Transparent proxy.** It speaks the OpenAI API and forwards requests largely untouched (model alias resolved, auth set). Point any OpenAI-compatible SDK at it by changing one base URL.
+
+If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — llmrouter is intentionally not that. It's the lean routing layer you drop in when you want fast, resilient multi-provider routing.
+
+### Design choices
+
+llmrouter has a bounded scope by design and has some deliberate omissions:
+
+- **No request-level failover or retries.** llmrouter is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let llmrouter steer those retries toward the healthiest provider.
+- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. llmrouter never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
 
 ## Quick start
 
@@ -107,6 +125,15 @@ error_decay_secs = 300     # time window for error rate calculation; old errors 
 
 Environment variables in `${VAR}` syntax are interpolated at config load time.
 
+### Loading secrets
+
+Where environment variables are available in an .env file, this can be passed with `--env-file`:
+
+```bash
+# Single .env file (KEY=VALUE per line)
+llmrouter --env-file /secrets/.env
+```
+
 ### Vertex billing attribution
 
 For Vertex providers, llmrouter can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:
@@ -122,15 +149,6 @@ vertex_ai = { project_id = "my-project", location = "us-central1", attribution =
 ```
 
 Sidecar keys take precedence over any client-supplied `labels` keys with the same name; disjoint client keys are preserved. The feature is currently scoped to Vertex only. Keys and values must conform to Vertex naming rules (`[a-z][a-z0-9_-]{0,62}`).
-
-### Loading secrets
-
-Where environment variables are available in an .env file, this can be passed with `--env-file`:
-
-```bash
-# Single .env file (KEY=VALUE per line)
-llmrouter --env-file /secrets/.env
-```
 
 ## Endpoints
 
@@ -201,7 +219,7 @@ Fully stateless — works across pods with no shared state. If the pinned provid
 
 When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
 
-The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/dannyboland/llmrouter`. Tags follow semver: `:latest`, `:3.0`, `:3.0.0`.
+The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/dannyboland/llmrouter`. Tags follow semver: `:latest`, `:4.0`, `:4.0.0`.
 
 To inject secrets via a mounted `.env` file:
 
