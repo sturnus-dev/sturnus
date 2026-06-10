@@ -48,7 +48,7 @@ response = client.chat.completions.create(
 
 - **Latency-based routing** — routes to the candidate with the lowest EWMA time-to-first-chunk per (provider, model).
 - **Explore/exploit** — a configurable fraction of traffic round-robins across all healthy candidates to discover cold providers and detect latency changes.
-- **Error rate tracking** — a time-based sliding window excludes failing candidates until their errors age out.
+- **Error rate tracking** — a time-based sliding window excludes failing candidates (any non-2xx response, including upstream 4xx) until their errors age out.
 - **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback on degradation.
 - **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive, with no buffering.
 - **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
