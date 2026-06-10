@@ -146,7 +146,13 @@ pub struct ModelCandidate {
 #[serde(default)]
 pub struct RoutingConfig {
     pub ewma_alpha: f64,
-    pub explore_ratio: f64,
+    /// Exploit sharpness for proportional routing: traffic to each candidate
+    /// scales with `(fastest_ewma / its_ewma)^exploit_k`. Defaults to a sensible
+    /// value; rarely needs changing.
+    pub exploit_k: f64,
+    /// Deprecated and ignored as of 4.1.0 — routing now uses proportional
+    /// weighting. Retained only to warn operators whose config still sets it.
+    pub explore_ratio: Option<f64>,
     pub error_threshold: f64,
     pub error_decay_secs: u64,
     pub connect_timeout_secs: u64,
@@ -160,7 +166,8 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             ewma_alpha: 0.3,
-            explore_ratio: 0.2,
+            exploit_k: crate::router::EXPLOIT_K,
+            explore_ratio: None,
             error_threshold: 0.5,
             error_decay_secs: 300,
             connect_timeout_secs: 10,
@@ -180,6 +187,11 @@ impl Config {
             shellexpand::env(&raw).map_err(|e| anyhow::anyhow!("env var expansion failed: {e}"))?;
         let config: Config = toml::from_str(&interpolated)?;
         config.validate()?;
+        if config.routing.explore_ratio.is_some() {
+            tracing::warn!(
+                "`routing.explore_ratio` is deprecated and ignored as of 4.1.0; routing now uses proportional latency weighting"
+            );
+        }
         Ok(config)
     }
 
@@ -218,10 +230,10 @@ impl Config {
                 self.routing.ewma_alpha
             );
         }
-        if !(0.0..=1.0).contains(&self.routing.explore_ratio) {
+        if !self.routing.exploit_k.is_finite() || self.routing.exploit_k < 0.0 {
             anyhow::bail!(
-                "explore_ratio must be between 0.0 and 1.0, got {}",
-                self.routing.explore_ratio
+                "exploit_k must be a finite value >= 0.0, got {}",
+                self.routing.exploit_k
             );
         }
         if !(0.0..=1.0).contains(&self.routing.error_threshold) {
@@ -381,6 +393,43 @@ fast = [{ provider = "openai", model = "gpt-4o-mini" }]
     }
 
     #[test]
+    fn exploit_k_rejects_negative() {
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+exploit_k = -1.0
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn deprecated_explore_ratio_is_accepted_and_ignored() {
+        let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+
+[routing]
+explore_ratio = 0.02
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        // Parses, validates, and is captured so load() can warn — but does not
+        // affect routing (which uses exploit_k).
+        assert!(config.validate().is_ok());
+        assert_eq!(config.routing.explore_ratio, Some(0.02));
+    }
+
+    #[test]
     fn timeout_explicit_values_override_defaults() {
         let toml_str = r#"
 [provider.openai]
@@ -397,66 +446,6 @@ read_timeout_secs = 120
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.routing.connect_timeout_secs, 5);
         assert_eq!(config.routing.read_timeout_secs, 120);
-    }
-
-    #[test]
-    fn explore_ratio_rejects_negative() {
-        let toml_str = r#"
-[provider.openai]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-test"
-
-[model]
-fast = [{ provider = "openai", model = "gpt-4o-mini" }]
-
-[routing]
-explore_ratio = -0.1
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn explore_ratio_rejects_greater_than_one() {
-        let toml_str = r#"
-[provider.openai]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-test"
-
-[model]
-fast = [{ provider = "openai", model = "gpt-4o-mini" }]
-
-[routing]
-explore_ratio = 1.5
-"#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn explore_ratio_accepts_valid_range() {
-        for ratio in &[0.0, 0.2, 0.5, 1.0] {
-            let toml_str = format!(
-                r#"
-[provider.openai]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-test"
-
-[model]
-fast = [{{ provider = "openai", model = "gpt-4o-mini" }}]
-
-[routing]
-explore_ratio = {}
-"#,
-                ratio
-            );
-            let config: Config = toml::from_str(&toml_str).unwrap();
-            assert!(
-                config.validate().is_ok(),
-                "explore_ratio {} should be valid",
-                ratio
-            );
-        }
     }
 
     #[test]

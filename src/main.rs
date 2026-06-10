@@ -142,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let explore_ratio = config.routing.explore_ratio;
+    let exploit_k = config.routing.exploit_k;
     let max_body_bytes = config.routing.max_body_bytes;
 
     let metrics = Metrics::new();
@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
         tracker,
         rr_state,
         client,
-        explore_ratio,
+        exploit_k,
         gcp_token_provider,
         max_body_bytes,
         metrics,

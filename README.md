@@ -46,8 +46,7 @@ response = client.chat.completions.create(
 
 ## Features
 
-- **Latency-based routing** — routes to the candidate with the lowest EWMA time-to-first-chunk per (provider, model).
-- **Explore/exploit** — a configurable fraction of traffic round-robins across all healthy candidates to discover cold providers and detect latency changes.
+- **Latency-based routing** — proportional weighting by EWMA latency per (provider, model): the fastest candidate gets the bulk of traffic while slower ones keep a small, shrinking share. That share doubles as a probe, so a provider that recovers wins traffic back automatically — no winner-take-all oscillation, no stale estimates.
 - **Error rate tracking** — a time-based sliding window excludes failing candidates (any non-2xx response, including upstream 4xx) until their errors age out.
 - **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback on degradation.
 - **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive, with no buffering.
@@ -113,7 +112,6 @@ smart = [
 
 [routing]
 ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
-explore_ratio = 0.2        # fraction of traffic that round-robins across all healthy candidates
 error_threshold = 0.5      # error rate above which a candidate is excluded
 error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
 ```
@@ -202,13 +200,13 @@ Fully stateless — works across pods with no shared state. If the pinned provid
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`
 2. Sidecar looks up the `fast` alias and partitions candidates into **warm** (have latency data, healthy), **cold** (no data yet), and **degraded** (high error rate)
-3. ~20% of requests (configurable via `explore_ratio`) round-robin across all healthy candidates (warm + cold) to discover new providers and detect latency changes
-4. Remaining requests go to the warm candidate with the lowest EWMA time-to-first-chunk
+3. Each healthy candidate (warm + cold) is weighted by `(fastest_ewma / its_ewma)^k`, so the fastest gets the bulk of traffic and slower ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks — no RNG, and the long-run split matches the weights without same-candidate bursts
+4. Because the slower candidates always keep a small share, their EWMA stays fresh — a provider that recovers wins traffic back automatically, with no winner-take-all herd; a cold candidate probes at a quarter of the fastest candidate's rate until its first samples land
 5. Degraded candidates are excluded entirely; they recover when errors age out of the time window
 6. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded
 7. TTFC is measured at first chunk arrival and fed back into the EWMA
 
-> **Tuning `explore_ratio` for production.** The default `0.2` favors visibility and fresh estimates at low/dev volume. Exploration trades a little latency for keeping EWMAs current and detecting when a provider recovers, and the right value scales inversely with traffic: at production volume `0.02`–`0.05` is usually plenty, since even a small fraction of high request rates yields many samples per provider.
+There is no explore ratio to tune: the fastest provider is exploited heavily while slower ones keep enough traffic to stay measured. A candidate's probe share shrinks with how slow it looks, so re-detecting a recovered provider costs on the order of `1/share` requests — near-instant at production volume, proportionally slower on a low-traffic alias.
 
 ## Why llmrouter
 
