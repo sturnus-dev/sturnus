@@ -1,0 +1,22 @@
+name: Branch image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["preview/**"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/tests.yml
+
+  image:
+    needs: test
+    uses: ./.github/workflows/docker-image.yml
+    with:
+      tags: |
+        type=ref,event=branch
+        type=sha
