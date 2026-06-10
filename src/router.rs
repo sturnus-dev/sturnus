@@ -311,16 +311,8 @@ mod tests {
         // the Weyl sequence must stay unbiased under that subsampling.
         let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
         for mode in [LatencyMode::Streaming, LatencyMode::NonStreaming] {
-            tracker.record_latency(
-                candidates[0].stats_index,
-                mode,
-                Duration::from_millis(100),
-            );
-            tracker.record_latency(
-                candidates[1].stats_index,
-                mode,
-                Duration::from_millis(200),
-            );
+            tracker.record_latency(candidates[0].stats_index, mode, Duration::from_millis(100));
+            tracker.record_latency(candidates[1].stats_index, mode, Duration::from_millis(200));
         }
 
         let n = 50_000;
