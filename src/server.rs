@@ -611,22 +611,30 @@ fast = [{{ provider = "test", model = "test-model" }}]
         assert_eq!(body["status"], "shutting_down");
     }
 
-    /// Mock upstream that accepts one request, waits for a signal, then responds.
-    async fn slow_upstream() -> (u16, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    /// Mock upstream that accepts one request, signals readiness, waits for a
+    /// release signal, then responds.
+    async fn slow_upstream() -> (
+        u16,
+        oneshot::Sender<()>,
+        oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = oneshot::channel::<()>();
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
             let (mut conn, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 4096];
             let _ = conn.read(&mut buf).await.unwrap();
+            let _ = ready_tx.send(());
             let _ = rx.await;
             conn.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":\"ok\"}"
             ).await.unwrap();
         });
-        (port, tx, handle)
+        (port, tx, ready_rx, handle)
     }
 
     /// Mock upstream that accepts one request and never responds.
@@ -659,7 +667,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
 
     #[tokio::test]
     async fn graceful_drain_waits_for_inflight_request() {
-        let (mock_port, upstream_tx, mock_handle) = slow_upstream().await;
+        let (mock_port, upstream_tx, upstream_ready, mock_handle) = slow_upstream().await;
         let state = test_state_with_upstream(mock_port);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -675,7 +683,8 @@ fast = [{{ provider = "test", model = "test-model" }}]
         ));
 
         let client_handle = proxy_request(addr);
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Request is in-flight once the upstream has received it.
+        upstream_ready.await.unwrap();
 
         shutdown_tx.send(()).unwrap();
 
