@@ -145,20 +145,27 @@ pub struct ModelCandidate {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct RoutingConfig {
+    /// Smoothing shared by the latency and success-rate EWMAs
+    /// (~`1/ewma_alpha` samples of memory).
     pub ewma_alpha: f64,
-    /// Exploit sharpness for proportional routing: traffic to each candidate
-    /// scales with `(fastest_ewma / its_ewma)^exploit_k`. Defaults to a sensible
-    /// value; rarely needs changing.
+    /// Exploit sharpness for proportional routing: traffic scales with
+    /// `(best_effective / its_effective)^exploit_k`, where effective latency
+    /// is the latency EWMA over the success-rate EWMA. Rarely needs changing.
     pub exploit_k: f64,
     /// Deprecated and ignored as of 4.1.0 — routing now uses proportional
     /// weighting. Retained only to warn operators whose config still sets it.
     pub explore_ratio: Option<f64>,
+    /// Error-rate EWMA above which a session-affinity pin is broken.
+    /// Routing weights never consult it.
     pub error_threshold: f64,
-    pub error_decay_secs: u64,
+    /// Deprecated and ignored as of 4.2.0 — the success-rate EWMA recovers
+    /// through probe traffic rather than a time window.
+    pub error_decay_secs: Option<u64>,
     pub connect_timeout_secs: u64,
     pub read_timeout_secs: u64,
     pub max_body_bytes: usize,
-    pub max_error_window_entries: usize,
+    /// Deprecated and ignored as of 4.2.0 — there is no error window to cap.
+    pub max_error_window_entries: Option<usize>,
     pub shutdown_timeout_secs: u64,
 }
 
@@ -169,11 +176,11 @@ impl Default for RoutingConfig {
             exploit_k: crate::router::EXPLOIT_K,
             explore_ratio: None,
             error_threshold: 0.5,
-            error_decay_secs: 300,
+            error_decay_secs: None,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
             max_body_bytes: 100 * 1024 * 1024, // 100 MB
-            max_error_window_entries: 10_000,
+            max_error_window_entries: None,
             shutdown_timeout_secs: 30,
         }
     }
@@ -190,6 +197,16 @@ impl Config {
         if config.routing.explore_ratio.is_some() {
             tracing::warn!(
                 "`routing.explore_ratio` is deprecated and ignored as of 4.1.0; routing now uses proportional latency weighting"
+            );
+        }
+        if config.routing.error_decay_secs.is_some() {
+            tracing::warn!(
+                "`routing.error_decay_secs` is deprecated and ignored as of 4.2.0; errors now proportionally reduce a candidate's routing weight"
+            );
+        }
+        if config.routing.max_error_window_entries.is_some() {
+            tracing::warn!(
+                "`routing.max_error_window_entries` is deprecated and ignored as of 4.2.0; errors now proportionally reduce a candidate's routing weight"
             );
         }
         Ok(config)

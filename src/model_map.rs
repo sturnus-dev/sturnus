@@ -143,7 +143,7 @@ fast = [{ provider = "openai", model = "gpt-4o-mini" }]
 cheap = [{ provider = "openai", model = "gpt-4o-mini" }]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let map = ModelMap::from_config(&config, &mut tracker).unwrap();
 
         let fast_idx = map.get("fast").unwrap()[0].stats_index;
@@ -172,7 +172,7 @@ noattr = [{ provider = "vertex-no-attr", model = "google/gemini-2.5-flash" }]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         config.validate().unwrap();
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let map = ModelMap::from_config(&config, &mut tracker).unwrap();
 
         let attr = &map.get("attr").unwrap()[0];
@@ -199,7 +199,7 @@ vertex_ai = { project_id = "p", location = "l" }
 test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let map = ModelMap::from_config(&config, &mut tracker).unwrap();
         assert!(map.get("test").unwrap()[0].attribution_labels.is_none());
     }
@@ -218,7 +218,7 @@ fast = [
 ]
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let map = ModelMap::from_config(&config, &mut tracker).unwrap();
 
         let candidates = map.get("fast").unwrap();

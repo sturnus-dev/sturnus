@@ -60,12 +60,9 @@ code = [
 
 [routing]
 ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
-explore_ratio = 0.2        # fraction that round-robins across all healthy candidates; lower to ~0.02-0.05 at production volume
-error_threshold = 0.5      # error rate above which a candidate is deprioritized
-error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
+error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken (routing weights are unaffected)
 connect_timeout_secs = 10  # max seconds to establish upstream connection
 read_timeout_secs = 60     # max seconds between chunks before treating upstream as hung
-session_ttl_secs = 1800    # sticky session TTL in seconds (default 30 min)
 
 # Vertex billing labels: merged into outbound bodies for any vertex_ai
 # provider with `attribution = true` (add the flag to its vertex_ai

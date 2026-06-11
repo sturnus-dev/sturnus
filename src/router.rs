@@ -27,14 +27,6 @@ impl RoundRobinState {
             .or_insert_with(|| std::sync::atomic::AtomicUsize::new(0));
     }
 
-    fn next(&self, alias: &str, count: usize) -> usize {
-        if let Some(counter) = self.counters.get(alias) {
-            counter.fetch_add(1, Ordering::Relaxed) % count
-        } else {
-            0
-        }
-    }
-
     fn next_tick(&self, alias: &str) -> u64 {
         self.counters
             .get(alias)
@@ -42,30 +34,42 @@ impl RoundRobinState {
     }
 }
 
-/// Default exploit sharpness (the `routing.exploit_k` default): traffic to each
-/// healthy candidate is proportional to `(fastest_ewma / its_ewma)^k`. Higher =
-/// stronger preference for the fastest. Scale-invariant (depends on the latency
-/// ratio, not absolute ms), so a fixed default generalises: a 2x-slower
-/// candidate gets ~1/8 the traffic, a 5x-slower one ~1/125.
+/// Default exploit sharpness (the `routing.exploit_k` default): traffic to
+/// each candidate is proportional to `(best_effective / its_effective)^k`,
+/// where effective latency folds the error rate in. Higher = stronger
+/// preference for the best. Scale-invariant (depends on the ratio, not
+/// absolute ms), so a fixed default generalises: a 2x-worse candidate gets
+/// ~1/8 the traffic, a 5x-worse one ~1/125.
 pub const EXPLOIT_K: f64 = 3.0;
 
-/// Fastest candidate gets this many weight units, so a slower candidate's
-/// minimum share (and probe-traffic floor) is ~`1 / WEIGHT_RESOLUTION`.
+/// Fastest candidate gets this many weight units; everyone else's weight is
+/// scaled relative to it (but never below the `PROBE_FLOOR` share).
 const WEIGHT_RESOLUTION: f64 = 1000.0;
 
 /// Cold candidates probe at this fraction of the fastest candidate's rate.
 const COLD_PROBE_WEIGHT: f64 = 0.25;
+
+/// Minimum weight for any candidate, as a fraction of `WEIGHT_RESOLUTION`.
+/// This is the probe rate for a hard-failing candidate, and it bounds both
+/// sides of the same trade: at most ~this share of alias traffic eats
+/// user-facing errors during an outage (there is no failover retry), and a
+/// recovered candidate is re-detected within ~`1/PROBE_FLOOR` requests.
+const PROBE_FLOOR: f64 = 0.01;
+
+/// Success-rate floor inside effective latency: a fully failing candidate
+/// gets a finite (huge) value rather than a division by zero.
+const MIN_SUCCESS_RATE: f64 = 1e-3;
 
 /// 2^64 / φ, the Weyl-sequence step. Odd, so `wrapping_mul` is a bijection.
 const WEYL_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Pick a candidate for `alias` by proportional weighting.
 ///
-/// Candidates are bucketed into warm (have EWMA for `mode`), cold (no data
-/// yet), and degraded (high error rate). Each healthy (warm + cold) candidate
-/// gets traffic proportional to `(fastest_ewma / its_ewma)^k`. Slower
-/// candidates keep a small share, so their EWMA stays fresh and a recovered
-/// provider wins traffic back at a rate proportional to that share.
+/// Weights use *effective latency* — the latency EWMA over the success-rate
+/// EWMA, i.e. expected time per successful response. Each candidate gets
+/// traffic proportional to `(best_effective / its_effective)^k`, so slower
+/// or erroring candidates keep a small but never-zero share. That share
+/// doubles as the probe through which a recovered candidate wins traffic back.
 pub fn select_candidate<'a>(
     alias: &str,
     candidates: &'a [ResolvedCandidate],
@@ -78,60 +82,52 @@ pub fn select_candidate<'a>(
         return None;
     }
 
-    let mut warm = Vec::new();
-    let mut cold = Vec::new();
-    let mut degraded = Vec::new();
-
-    for c in candidates {
-        let stats = tracker.stats(c.stats_index);
-        if tracker.is_degraded(c.stats_index) {
-            degraded.push(c);
-        } else if stats.is_cold(mode) {
-            cold.push(c);
-        } else {
-            warm.push(c);
-        }
-    }
-
-    // Nothing healthy: round-robin across degraded so we still attempt delivery.
-    if warm.is_empty() && cold.is_empty() {
-        if degraded.is_empty() {
-            return None;
-        }
-        let idx = rr.next(alias, degraded.len());
-        return Some(degraded[idx]);
-    }
-
-    // No data for this mode yet: round-robin across cold to warm them up.
-    if warm.is_empty() {
-        let idx = rr.next(alias, cold.len());
-        return Some(cold[idx]);
-    }
-
-    // Reference = fastest warm candidate (guarded against a 0ms EWMA).
-    let best_ms = warm
+    // Effective latency (ms per successful response); None = cold for `mode`.
+    let effective: Vec<Option<f64>> = candidates
         .iter()
-        .map(|c| tracker.stats(c.stats_index).ewma_ms(mode))
-        .min()
-        .unwrap_or(1)
-        .max(1);
+        .map(|c| {
+            let stats = tracker.stats(c.stats_index);
+            if stats.is_cold(mode) {
+                None
+            } else {
+                // Guarded against a 0ms EWMA.
+                #[allow(clippy::cast_precision_loss)]
+                Some(stats.ewma_ms(mode).max(1) as f64 / stats.success_rate().max(MIN_SUCCESS_RATE))
+            }
+        })
+        .collect();
 
-    // Floor at 1 unit so no candidate starves.
-    let mut weighted: Vec<(&ResolvedCandidate, usize)> =
-        Vec::with_capacity(warm.len() + cold.len());
+    // Reference = best effective latency; infinite while everyone is cold.
+    let best = effective
+        .iter()
+        .flatten()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+
+    // Floor at the probe share so no candidate starves.
+    let mut weighted: Vec<(&ResolvedCandidate, usize)> = Vec::with_capacity(candidates.len());
     let mut total: usize = 0;
-    for c in warm.iter().chain(cold.iter()) {
-        let stats = tracker.stats(c.stats_index);
-        let raw = if stats.is_cold(mode) {
-            COLD_PROBE_WEIGHT
-        } else {
-            #[allow(clippy::cast_precision_loss)]
-            (best_ms as f64 / stats.ewma_ms(mode).max(1) as f64).powf(k)
+    for (candidate, effective_latency) in candidates.iter().zip(&effective) {
+        let raw_weight = match effective_latency {
+            Some(latency) => (best / latency).powf(k),
+            // Cold: fixed probe share (full when everyone is cold), scaled
+            // by success rate so erroring cold candidates back off too.
+            None => {
+                let rate = tracker.stats(candidate.stats_index).success_rate();
+                let base = if best.is_finite() {
+                    COLD_PROBE_WEIGHT
+                } else {
+                    1.0
+                };
+                base * rate.max(MIN_SUCCESS_RATE).powf(k)
+            }
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let w = (raw * WEIGHT_RESOLUTION).round().max(1.0) as usize;
-        weighted.push((c, w));
-        total += w;
+        let weight = (raw_weight * WEIGHT_RESOLUTION)
+            .round()
+            .max(WEIGHT_RESOLUTION * PROBE_FLOOR) as usize;
+        weighted.push((candidate, weight));
+        total += weight;
     }
 
     // Golden-ratio Weyl sequence (n·2^64/φ): a deterministic stand-in for the
@@ -174,7 +170,7 @@ mod tests {
     }
 
     fn setup(specs: &[(&str, &str)]) -> (Vec<ResolvedCandidate>, Tracker, RoundRobinState) {
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let mut rr = RoundRobinState::new();
         rr.register_alias("test".to_string());
         let candidates: Vec<_> = specs
@@ -231,12 +227,12 @@ mod tests {
     fn lowest_ewma_gets_the_large_majority() {
         let (candidates, tracker, rr) = setup(&[("slow", "m1"), ("fast", "m2")]);
 
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(500),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[1].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(100),
@@ -271,12 +267,12 @@ mod tests {
         // has weight (1/2)^3 = 0.125 against the fastest's 1, i.e. a normalised
         // share of 0.125 / 1.125 ≈ 0.111 — never 0 (winner-take-all) nor 0.5 (RR).
         let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(100),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[1].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(200),
@@ -311,8 +307,8 @@ mod tests {
         // the Weyl sequence must stay unbiased under that subsampling.
         let (candidates, tracker, rr) = setup(&[("fast", "m1"), ("slow", "m2")]);
         for mode in [LatencyMode::Streaming, LatencyMode::NonStreaming] {
-            tracker.record_latency(candidates[0].stats_index, mode, Duration::from_millis(100));
-            tracker.record_latency(candidates[1].stats_index, mode, Duration::from_millis(200));
+            tracker.record_success(candidates[0].stats_index, mode, Duration::from_millis(100));
+            tracker.record_success(candidates[1].stats_index, mode, Duration::from_millis(200));
         }
 
         let n = 50_000;
@@ -354,16 +350,38 @@ mod tests {
         counts.into_iter().max_by_key(|(_, n)| *n).unwrap().0
     }
 
+    /// Share of picks going to `provider` over `n` weighted selections.
+    fn share_of(
+        provider: &str,
+        n: u32,
+        candidates: &[ResolvedCandidate],
+        tracker: &Tracker,
+        rr: &RoundRobinState,
+    ) -> f64 {
+        let mut hits = 0u32;
+        for _ in 0..n {
+            let picked =
+                select_candidate("test", candidates, tracker, rr, 3.0, LatencyMode::Streaming)
+                    .unwrap();
+            if picked.provider_name == provider {
+                hits += 1;
+            }
+        }
+        f64::from(hits) / f64::from(n)
+    }
+
     #[test]
-    fn degraded_candidate_excluded() {
+    fn erroring_candidate_gets_minimal_share_despite_speed() {
+        // bad is 4x faster but failing hard: its effective latency blows up
+        // and its share collapses to the probe floor.
         let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
 
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(200),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[1].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(50),
@@ -372,27 +390,100 @@ mod tests {
         for _ in 0..10 {
             tracker.record_error(candidates[1].stats_index);
         }
-        assert!(tracker.is_degraded(candidates[1].stats_index));
 
-        for _ in 0..20 {
-            let picked = select_candidate(
-                "test",
-                &candidates,
-                &tracker,
-                &rr,
-                3.0,
+        let bad_share = share_of("bad", 10_000, &candidates, &tracker, &rr);
+        assert!(
+            bad_share < 0.05,
+            "hard-failing candidate should be near the floor, got {bad_share:.3}"
+        );
+        assert!(
+            bad_share > 0.0,
+            "the floor share must keep probing a failing candidate"
+        );
+    }
+
+    #[test]
+    fn hard_failing_candidate_share_is_pinned_at_probe_floor() {
+        // The floor bounds both sides of the trade: at most ~PROBE_FLOOR of
+        // traffic eats errors during an outage, and recovery is detected
+        // within ~1/PROBE_FLOOR requests. Expected share with two candidates:
+        // 10 / (1000 + 10) ≈ 0.0099.
+        let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
+        for c in &candidates {
+            tracker.record_success(
+                c.stats_index,
                 LatencyMode::Streaming,
-            )
-            .unwrap();
-            assert_eq!(picked.provider_name, "good");
+                Duration::from_millis(100),
+            );
         }
+        for _ in 0..50 {
+            tracker.record_error(candidates[1].stats_index);
+        }
+
+        let bad_share = share_of("bad", 100_000, &candidates, &tracker, &rr);
+        assert!(
+            (0.005..0.02).contains(&bad_share),
+            "share should be pinned near PROBE_FLOOR, got {bad_share:.4}"
+        );
+    }
+
+    #[test]
+    fn single_error_reduces_share_proportionally() {
+        // Equal latency, one error at alpha 0.3: success EWMA 0.7, weight
+        // 0.7^3 = 0.343, share 0.343/1.343 ≈ 0.26 — proportional, not a cliff.
+        let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
+        for c in &candidates {
+            tracker.record_success(
+                c.stats_index,
+                LatencyMode::Streaming,
+                Duration::from_millis(100),
+            );
+        }
+        tracker.record_error(candidates[1].stats_index);
+
+        let b_share = share_of("b", 100_000, &candidates, &tracker, &rr);
+        assert!(
+            (b_share - 0.255).abs() < 0.02,
+            "one error should cost a proportional share, got {b_share:.3}"
+        );
+    }
+
+    #[test]
+    fn erroring_candidate_recovers_share_through_probes() {
+        let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
+        for c in &candidates {
+            tracker.record_success(
+                c.stats_index,
+                LatencyMode::Streaming,
+                Duration::from_millis(100),
+            );
+        }
+
+        for _ in 0..10 {
+            tracker.record_error(candidates[1].stats_index);
+        }
+        assert!(share_of("b", 10_000, &candidates, &tracker, &rr) < 0.05);
+
+        // Probe successes rebuild the EWMA; the share follows.
+        for _ in 0..20 {
+            tracker.record_success(
+                candidates[1].stats_index,
+                LatencyMode::Streaming,
+                Duration::from_millis(100),
+            );
+        }
+        let recovered = share_of("b", 10_000, &candidates, &tracker, &rr);
+        assert!(
+            (recovered - 0.5).abs() < 0.05,
+            "recovered candidate should win back its share, got {recovered:.3}"
+        );
     }
 
     #[test]
     fn cold_candidate_is_probed() {
         let (candidates, tracker, rr) = setup(&[("warm", "m1"), ("cold", "m2")]);
 
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(100),
@@ -426,12 +517,12 @@ mod tests {
     fn traffic_shifts_when_latency_increases() {
         let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
 
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(100),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[1].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(300),
@@ -442,7 +533,7 @@ mod tests {
         );
 
         for _ in 0..20 {
-            tracker.record_latency(
+            tracker.record_success(
                 candidates[0].stats_index,
                 LatencyMode::Streaming,
                 Duration::from_millis(500),
@@ -455,10 +546,12 @@ mod tests {
     }
 
     #[test]
-    fn cold_candidate_with_errors_is_degraded_not_weighted() {
+    fn cold_candidate_with_errors_probes_at_the_floor() {
+        // Errors never warm the latency EWMA, so a failing candidate can stay
+        // cold forever; its probe share must still scale down.
         let (candidates, tracker, rr) = setup(&[("good", "m1"), ("bad", "m2")]);
 
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(100),
@@ -467,25 +560,15 @@ mod tests {
         for _ in 0..10 {
             tracker.record_error(candidates[1].stats_index);
         }
-
-        // Cold (no EWMA) but degraded takes priority
         assert!(tracker
             .stats(candidates[1].stats_index)
             .is_cold(LatencyMode::Streaming));
-        assert!(tracker.is_degraded(candidates[1].stats_index));
 
-        for _ in 0..20 {
-            let picked = select_candidate(
-                "test",
-                &candidates,
-                &tracker,
-                &rr,
-                3.0,
-                LatencyMode::Streaming,
-            )
-            .unwrap();
-            assert_eq!(picked.provider_name, "good");
-        }
+        let bad_share = share_of("bad", 10_000, &candidates, &tracker, &rr);
+        assert!(
+            bad_share < 0.05,
+            "failing cold candidate should be near the floor, got {bad_share:.3}"
+        );
     }
 
     #[test]
@@ -493,22 +576,22 @@ mod tests {
         let (candidates, tracker, rr) = setup(&[("a", "m1"), ("b", "m2")]);
 
         // a fast on streaming, slow on non-streaming; b the reverse.
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(50),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[0].stats_index,
             LatencyMode::NonStreaming,
             Duration::from_millis(5_000),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[1].stats_index,
             LatencyMode::Streaming,
             Duration::from_millis(5_000),
         );
-        tracker.record_latency(
+        tracker.record_success(
             candidates[1].stats_index,
             LatencyMode::NonStreaming,
             Duration::from_millis(50),
@@ -546,7 +629,7 @@ mod tests {
     /// in-flight picks route on a stale EWMA.
     fn simulate_load_dependent() -> (Vec<usize>, Vec<bool>) {
         let mode = LatencyMode::NonStreaming;
-        let mut tracker = Tracker::new(0.3, 300, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let g = tracker.register();
         let o = tracker.register();
         let candidates = vec![
@@ -555,8 +638,8 @@ mod tests {
         ];
         let mut rr = RoundRobinState::new();
         rr.register_alias("test".to_string());
-        tracker.record_latency(g, mode, Duration::from_millis(600));
-        tracker.record_latency(o, mode, Duration::from_millis(2000));
+        tracker.record_success(g, mode, Duration::from_millis(600));
+        tracker.record_success(o, mode, Duration::from_millis(2000));
 
         let n = 12_000usize;
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -581,7 +664,7 @@ mod tests {
                 0 => 600,
                 _ => 2000,
             };
-            tracker.record_latency(
+            tracker.record_success(
                 candidates[idx].stats_index,
                 mode,
                 Duration::from_millis(latency),

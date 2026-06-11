@@ -165,12 +165,14 @@ pub async fn handle_request(
         .and_then(|value| value.to_str().ok())
         .and_then(|string| string.split_once('/'));
 
+    // A pin is honored until the pinned candidate's error-rate EWMA breaches
+    // `error_threshold`; routing weights never consult the threshold.
     let pinned = affinity.and_then(|(provider, model)| {
         let found = candidates
             .iter()
             .find(|c| c.provider_name == provider && c.model == model)?;
         if state.tracker.is_degraded(found.stats_index) {
-            debug!(provider = %provider, model = %model, "affinity provider degraded, re-routing");
+            debug!(provider = %provider, model = %model, "affinity candidate above error threshold, re-routing");
             None
         } else {
             Some(found)
@@ -249,8 +251,7 @@ pub async fn handle_request(
             if status.is_success() {
                 state
                     .tracker
-                    .record_latency(stats_index, observed_mode, latency);
-                state.tracker.record_success(stats_index);
+                    .record_success(stats_index, observed_mode, latency);
                 debug!(
                     provider = %provider,
                     model = %model,
@@ -394,11 +395,10 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
         let stats = state.tracker.stats(c.stats_index);
         let streaming_ewma = stats.ewma_ms(LatencyMode::Streaming);
         let nonstreaming_ewma = stats.ewma_ms(LatencyMode::NonStreaming);
-        let degraded = state.tracker.is_degraded(c.stats_index);
         let any_warm = streaming_ewma != u64::MAX || nonstreaming_ewma != u64::MAX;
         let status = if !any_warm {
             "cold"
-        } else if degraded {
+        } else if state.tracker.is_degraded(c.stats_index) {
             "degraded"
         } else {
             "warm"
@@ -410,7 +410,7 @@ fn build_status_response(state: &AppState) -> Response<BoxBody> {
             "status": status,
             "streaming_ewma_ms": (streaming_ewma != u64::MAX).then_some(streaming_ewma),
             "nonstreaming_ewma_ms": (nonstreaming_ewma != u64::MAX).then_some(nonstreaming_ewma),
-            "error_rate": stats.error_rate(),
+            "error_rate": 1.0 - stats.success_rate(),
         }));
     }
 
@@ -446,7 +446,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
         ))
         .unwrap();
 
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
         let mut rr_state = RoundRobinState::new();
         for alias in config.model.keys() {
@@ -853,7 +853,7 @@ fast = [
         ))
         .unwrap();
 
-        let mut tracker = Tracker::new(0.3, 30, 0.5, 10_000);
+        let mut tracker = Tracker::new(0.3, 0.5);
         let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
         let mut rr_state = RoundRobinState::new();
         for alias in config.model.keys() {
@@ -874,18 +874,16 @@ fast = [
             .find(|c| c.provider_name == "beta")
             .unwrap()
             .stats_index;
-        tracker.record_latency(
+        tracker.record_success(
             alpha_idx,
             LatencyMode::NonStreaming,
             Duration::from_millis(500),
         );
-        tracker.record_success(alpha_idx);
-        tracker.record_latency(
+        tracker.record_success(
             beta_idx,
             LatencyMode::NonStreaming,
             Duration::from_millis(10),
         );
-        tracker.record_success(beta_idx);
 
         let state = Arc::new(AppState {
             model_map,
@@ -920,6 +918,111 @@ fast = [
             provider, "alpha",
             "affinity should pin to alpha even though beta is faster"
         );
+
+        handle_a.abort();
+        handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn affinity_pin_broken_when_error_ewma_breaches_threshold() {
+        crate::init_crypto();
+        let (port_a, handle_a) = instant_upstream(0).await;
+        let (port_b, handle_b) = instant_upstream(1).await;
+
+        // beta listed first: the first Weyl tick lands on the first weight
+        // unit, which would be alpha's probe slice otherwise.
+        let config: crate::config::Config = toml::from_str(&format!(
+            r#"
+[provider.alpha]
+base_url = "http://127.0.0.1:{port_a}"
+api_key = "fake"
+
+[provider.beta]
+base_url = "http://127.0.0.1:{port_b}"
+api_key = "fake"
+
+[model]
+fast = [
+  {{ provider = "beta",  model = "test-model" }},
+  {{ provider = "alpha", model = "test-model" }},
+]
+"#,
+        ))
+        .unwrap();
+
+        let mut tracker = Tracker::new(0.3, 0.5);
+        let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
+        let mut rr_state = RoundRobinState::new();
+        for alias in config.model.keys() {
+            rr_state.register_alias(alias.clone());
+        }
+
+        let fast_candidates = model_map.get("fast").unwrap();
+        let alpha_idx = fast_candidates
+            .iter()
+            .find(|c| c.provider_name == "alpha")
+            .unwrap()
+            .stats_index;
+        let beta_idx = fast_candidates
+            .iter()
+            .find(|c| c.provider_name == "beta")
+            .unwrap()
+            .stats_index;
+
+        // alpha warm but failing (error EWMA > 0.5); beta healthy.
+        tracker.record_success(
+            alpha_idx,
+            LatencyMode::NonStreaming,
+            Duration::from_millis(500),
+        );
+        for _ in 0..5 {
+            tracker.record_error(alpha_idx);
+        }
+        tracker.record_success(
+            beta_idx,
+            LatencyMode::NonStreaming,
+            Duration::from_millis(10),
+        );
+
+        let state = Arc::new(AppState {
+            model_map,
+            tracker,
+            rr_state,
+            client: reqwest::Client::new(),
+            exploit_k: 3.0,
+            gcp_token_provider: None,
+            max_body_bytes: 100 * 1024 * 1024,
+            metrics: Metrics::new(),
+            shutting_down: AtomicBool::new(false),
+        });
+        let (addr, _tx, _server) = start_server(state);
+
+        // Pin to the failing provider: must break and re-route.
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("x-session-affinity", "alpha/test-model")
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let provider = resp
+            .headers()
+            .get("x-llmrouter-provider")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            provider, "beta",
+            "pin to a candidate above the error threshold should be broken"
+        );
+        let affinity = resp
+            .headers()
+            .get("x-session-affinity")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(affinity, "beta/test-model");
 
         handle_a.abort();
         handle_b.abort();

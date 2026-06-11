@@ -46,9 +46,8 @@ response = client.chat.completions.create(
 
 ## Features
 
-- **Latency-based routing** — proportional weighting by EWMA latency per (provider, model): the fastest candidate gets the bulk of traffic while slower ones keep a small, shrinking share. That share doubles as a probe, so a provider that recovers wins traffic back automatically — no winner-take-all oscillation, no stale estimates.
-- **Error rate tracking** — a time-based sliding window excludes failing candidates (any non-2xx response, including upstream 4xx) until their errors age out.
-- **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback on degradation.
+- **Latency- and error-aware routing** — proportional weighting by *effective latency* per (provider, model): the latency EWMA divided by the success-rate EWMA, i.e. the expected time per successful response. The best candidate gets the bulk of traffic while slower or erroring ones keep a small, shrinking share. That share doubles as a probe, so a provider that recovers wins traffic back automatically — no winner-take-all oscillation, no thresholds to trip or age out.
+- **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback when the pinned candidate's error rate breaches `error_threshold`.
 - **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive, with no buffering.
 - **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
 - **Zero infrastructure** — a single static binary; no Redis, database, or control plane.
@@ -111,9 +110,8 @@ smart = [
 ]
 
 [routing]
-ewma_alpha = 0.3          # EWMA smoothing factor (higher = more reactive)
-error_threshold = 0.5      # error rate above which a candidate is excluded
-error_decay_secs = 300     # time window for error rate calculation; old errors age out naturally
+ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs (higher = more reactive)
+error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken (routing weights are unaffected)
 ```
 
 Environment variables in `${VAR}` syntax are interpolated at config load time. Where they're available in an `.env` file (`KEY=VALUE` per line), pass it with `--env-file`:
@@ -194,19 +192,18 @@ response = client.chat.completions.create(
 )
 ```
 
-Fully stateless — works across pods with no shared state. If the pinned provider degrades, the header is ignored and a new provider is selected (check the updated `x-session-affinity` in the response).
+Fully stateless — works across pods with no shared state. The pin is honored until the pinned candidate's error-rate EWMA breaches `error_threshold` (at the default smoothing, roughly two consecutive errors), at which point the header is ignored and a new provider is selected — check the updated `x-session-affinity` in the response. Unknown or malformed headers fall back to normal routing.
 
 ## How routing works
 
 1. Client sends `POST /v1/chat/completions` with `"model": "fast"`
-2. Sidecar looks up the `fast` alias and partitions candidates into **warm** (have latency data, healthy), **cold** (no data yet), and **degraded** (high error rate)
-3. Each healthy candidate (warm + cold) is weighted by `(fastest_ewma / its_ewma)^k`, so the fastest gets the bulk of traffic and slower ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks — no RNG, and the long-run split matches the weights without same-candidate bursts
-4. Because the slower candidates always keep a small share, their EWMA stays fresh — a provider that recovers wins traffic back automatically, with no winner-take-all herd; a cold candidate probes at a quarter of the fastest candidate's rate until its first samples land
-5. Degraded candidates are excluded entirely; they recover when errors age out of the time window
-6. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded
-7. TTFC is measured at first chunk arrival and fed back into the EWMA
+2. Sidecar looks up the `fast` alias and computes each candidate's **effective latency**: its latency EWMA divided by its success-rate EWMA. A candidate erroring with probability `p` needs ~`1/(1-p)` attempts per success, so errors inflate effective latency the way slowness does — one signal, no separate health state
+3. Each candidate is weighted by `(best_effective / its_effective)^k`, so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks — no RNG, and the long-run split matches the weights without same-candidate bursts
+4. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically, with no winner-take-all herd and no threshold or time window to wait out; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land
+5. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded
+6. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA
 
-There is no explore ratio to tune: the fastest provider is exploited heavily while slower ones keep enough traffic to stay measured. A candidate's probe share shrinks with how slow it looks, so re-detecting a recovered provider costs on the order of `1/share` requests — near-instant at production volume, proportionally slower on a low-traffic alias.
+The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
 
 ## Why llmrouter
 
