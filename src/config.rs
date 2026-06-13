@@ -163,7 +163,15 @@ pub struct RoutingConfig {
     pub error_decay_secs: Option<u64>,
     pub connect_timeout_secs: u64,
     pub read_timeout_secs: u64,
+    /// Maximum request body size in bytes; larger requests 413.
+    /// The 32 MB default matches the request-size cap of the largest
+    /// mainstream provider APIs.
     pub max_body_bytes: usize,
+    /// Cap on the *total* bytes of request bodies buffered across all
+    /// in-flight requests; beyond it new requests get 429. Defaults to
+    /// half the container's cgroup memory limit when one is detected,
+    /// else `4 * max_body_bytes`.
+    pub max_buffered_bytes: Option<usize>,
     /// Deprecated and ignored as of 4.2.0 — there is no error window to cap.
     pub max_error_window_entries: Option<usize>,
     pub shutdown_timeout_secs: u64,
@@ -179,11 +187,41 @@ impl Default for RoutingConfig {
             error_decay_secs: None,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
-            max_body_bytes: 100 * 1024 * 1024, // 100 MB
+            max_body_bytes: 32 * 1024 * 1024, // 32 MB
+            max_buffered_bytes: None,
             max_error_window_entries: None,
             shutdown_timeout_secs: 30,
         }
     }
+}
+
+impl RoutingConfig {
+    /// Resolve the aggregate buffer budget in bytes, and where it came
+    /// from (for the startup log): explicit config, half the cgroup
+    /// memory limit, or a multiple of the per-request cap.
+    pub fn buffer_budget_bytes(&self) -> (usize, &'static str) {
+        if let Some(bytes) = self.max_buffered_bytes {
+            return (bytes, "max_buffered_bytes");
+        }
+        if let Some(limit) = cgroup_memory_limit() {
+            return (usize::try_from(limit / 2).unwrap_or(usize::MAX), "cgroup");
+        }
+        (self.max_body_bytes.saturating_mul(4), "4x max_body_bytes")
+    }
+}
+
+/// The container's memory limit from cgroups (v2, then v1), if one is set.
+fn cgroup_memory_limit() -> Option<u64> {
+    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        // v2: a byte count, or "max" when unlimited.
+        return raw.trim().parse().ok();
+    }
+    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
+    let limit: u64 = raw.trim().parse().ok()?;
+    // v1 reports a page-rounded i64::MAX when unlimited.
+    const UNBOUNDED_THRESHOLD: u64 = 1u64 << 60;
+    // Use cgroup limit if bounded, otherwise None and fallback should be used
+    (limit < UNBOUNDED_THRESHOLD).then_some(limit)
 }
 
 impl Config {

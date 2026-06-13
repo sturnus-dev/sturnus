@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
+use hyper::body::Body as _;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -29,9 +30,45 @@ pub struct AppState {
     pub client: reqwest::Client,
     pub exploit_k: f64,
     pub gcp_token_provider: Option<GcpTokenProvider>,
-    pub max_body_bytes: usize,
+    pub budget: BufferBudget,
     pub metrics: Metrics,
     pub shutting_down: AtomicBool,
+}
+
+/// Caps how much memory all in-flight requests may spend buffering bodies,
+/// and the size of any single body. The one place that decides admission:
+/// too big for the cap → 413, momentarily over budget → 429.
+pub struct BufferBudget {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    permits: usize,
+    pub max_body_bytes: usize,
+}
+
+impl BufferBudget {
+    pub fn new(budget_bytes: usize, max_body_bytes: usize) -> Self {
+        let permits = (budget_bytes / 1024).clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
+            permits,
+            max_body_bytes: max_body_bytes.min(permits * 1024),
+        }
+    }
+
+    /// Reserve permits for `bytes` of buffer (1 KB granularity, at least
+    /// one), or None if the budget is exhausted.
+    fn reserve(&self, bytes: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let want = u32::try_from(bytes.div_ceil(1024).max(1)).unwrap_or(u32::MAX);
+        self.semaphore.clone().try_acquire_many_owned(want).ok()
+    }
+
+    /// The budget's total size in KB-permits.
+    pub fn permits(&self) -> usize {
+        self.permits
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
 }
 
 type BoxBody = http_body_util::Either<
@@ -110,43 +147,78 @@ pub async fn handle_request(
 
     let affinity_header = req.headers_mut().remove("x-session-affinity");
 
-    let max_body = state.max_body_bytes;
+    let max_body = state.budget.max_body_bytes;
+
+    // We have to reserve the request size before buffering it
+    // We 413 if too large or 429 if we don't have memory for it just now.
+    let Some(declared_len) = req
+        .body()
+        .size_hint()
+        .exact()
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return Ok(json_error(
+            hyper::StatusCode::LENGTH_REQUIRED,
+            "Content-Length is required",
+        ));
+    };
+    if declared_len > max_body {
+        return Ok(json_error(
+            hyper::StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("request body too large (max {} MB)", max_body / 1024 / 1024),
+        ));
+    }
+    let Some(permit) = state.budget.reserve(declared_len) else {
+        state.metrics.buffer_rejections_total.inc();
+        let mut resp = json_error(
+            hyper::StatusCode::TOO_MANY_REQUESTS,
+            "buffer budget exhausted, retry shortly",
+        );
+        resp.headers_mut().insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static("1"),
+        );
+        return Ok(resp);
+    };
+
     let body_bytes = match Limited::new(req, max_body).collect().await {
         Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!("failed to read request body: {e}");
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
             return Ok(json_error(
                 hyper::StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("request body too large (max {} MB)", max_body / 1024 / 1024),
             ));
         }
-    };
-
-    let body_map: serde_json::Map<String, serde_json::Value> =
-        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-            Ok(serde_json::Value::Object(m)) => m,
-            Ok(_) => {
-                return Ok(json_error(
-                    hyper::StatusCode::BAD_REQUEST,
-                    "request body must be a JSON object",
-                ));
-            }
-            Err(e) => {
-                return Ok(json_error(
-                    hyper::StatusCode::BAD_REQUEST,
-                    &format!("request body is not valid JSON: {e}"),
-                ));
-            }
-        };
-
-    let alias = match body_map.get("model").and_then(|v| v.as_str()) {
-        Some(s) => s.to_string(),
-        None => {
+        Err(e) => {
+            warn!("failed to read request body: {e}");
             return Ok(json_error(
                 hyper::StatusCode::BAD_REQUEST,
-                "missing 'model' field in request body",
+                "failed to read request body",
             ));
         }
+    };
+
+    let body: crate::body::RawBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) if e.classify() == serde_json::error::Category::Data => {
+            return Ok(json_error(
+                hyper::StatusCode::BAD_REQUEST,
+                "request body must be a JSON object",
+            ));
+        }
+        Err(e) => {
+            return Ok(json_error(
+                hyper::StatusCode::BAD_REQUEST,
+                &format!("request body is not valid JSON: {e}"),
+            ));
+        }
+    };
+
+    let Some(alias) = body.get_as::<String>("model") else {
+        return Ok(json_error(
+            hyper::StatusCode::BAD_REQUEST,
+            "missing 'model' field in request body",
+        ));
     };
 
     let Some(candidates) = state.model_map.get(&alias) else {
@@ -180,10 +252,7 @@ pub async fn handle_request(
     });
 
     // Needed before routing: mode selects which EWMA the router compares.
-    let is_streaming = body_map
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let is_streaming = body.get_as::<bool>("stream").unwrap_or(false);
     let latency_mode = if is_streaming {
         LatencyMode::Streaming
     } else {
@@ -221,12 +290,31 @@ pub async fn handle_request(
         "routing request"
     );
 
+    let outbound = match proxy::prepare_outbound(
+        body,
+        &candidate.model,
+        candidate.attribution_labels.as_deref(),
+        Some(permit),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(error = %e, "failed to serialize outbound body");
+            return Ok(json_error(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize outbound body",
+            ));
+        }
+    };
+    // Only the outbound copy is held while waiting on the upstream.
+    drop(body_bytes);
+
     let result = proxy::forward_request(
         &state.client,
         candidate,
         &path,
-        body_map,
+        outbound,
         is_streaming,
+        state.budget.max_body_bytes,
         state.gcp_token_provider.as_ref(),
     )
     .await;
@@ -433,6 +521,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     fn test_state_with_upstream(upstream_port: u16) -> Arc<AppState> {
+        test_state_with_budget(upstream_port, 128 * 1024)
+    }
+
+    fn test_state_with_budget(upstream_port: u16, budget_kb: usize) -> Arc<AppState> {
         crate::init_crypto();
         let config: crate::config::Config = toml::from_str(&format!(
             r#"
@@ -460,7 +552,7 @@ fast = [{{ provider = "test", model = "test-model" }}]
             client: reqwest::Client::new(),
             exploit_k: 3.0,
             gcp_token_provider: None,
-            max_body_bytes: 100 * 1024 * 1024,
+            budget: BufferBudget::new(budget_kb * 1024, 32 * 1024 * 1024),
             metrics: Metrics::new(),
             shutting_down: AtomicBool::new(false),
         })
@@ -468,6 +560,100 @@ fast = [{{ provider = "test", model = "test-model" }}]
 
     fn test_state() -> Arc<AppState> {
         test_state_with_upstream(9999)
+    }
+
+    #[tokio::test]
+    async fn budget_exhaustion_sheds_with_429_and_retry_after() {
+        let state = test_state();
+        // Drain the whole budget so the next request finds no permits.
+        let _held = state.budget.reserve(state.budget.permits() * 1024).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(run_server(
+            listener,
+            state.clone(),
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 429);
+        assert_eq!(resp.headers().get("retry-after").unwrap(), "1");
+        assert_eq!(state.metrics.buffer_rejections_total.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_content_length_gets_411() {
+        let state = test_state();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(run_server(
+            listener,
+            state.clone(),
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+
+        // A streamed body has no Content-Length: reqwest sends it chunked.
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+            vec![Ok(bytes::Bytes::from_static(br#"{"model":"fast"}"#))];
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                chunks,
+            )))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 411);
+        // No budget held or rejection counted: this is a client error.
+        assert_eq!(state.budget.available_permits(), state.budget.permits());
+        assert_eq!(state.metrics.buffer_rejections_total.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_larger_than_whole_budget_gets_413() {
+        // 4 KB total budget; an 8 KB request can never fit, so it must get
+        // a non-retryable 413 instead of a 429.
+        let state = test_state_with_budget(9999, 4);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(run_server(
+            listener,
+            state.clone(),
+            async {
+                let _ = rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+
+        let body = format!(r#"{{"model":"fast","content":"{}"}}"#, "x".repeat(8 * 1024));
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 413);
+        assert_eq!(state.metrics.buffer_rejections_total.get(), 0);
     }
 
     #[tokio::test]
@@ -892,7 +1078,7 @@ fast = [
             client: reqwest::Client::new(),
             exploit_k: 3.0,
             gcp_token_provider: None,
-            max_body_bytes: 100 * 1024 * 1024,
+            budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
             metrics: Metrics::new(),
             shutting_down: AtomicBool::new(false),
         });
@@ -991,7 +1177,7 @@ fast = [
             client: reqwest::Client::new(),
             exploit_k: 3.0,
             gcp_token_provider: None,
-            max_body_bytes: 100 * 1024 * 1024,
+            budget: BufferBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024),
             metrics: Metrics::new(),
             shutting_down: AtomicBool::new(false),
         });
@@ -1113,6 +1299,165 @@ fast = [
                 .stats(stats_index)
                 .is_cold(LatencyMode::NonStreaming),
             "fast 4xx responses must not pollute EWMA latency stats"
+        );
+
+        mock_handle.abort();
+    }
+
+    /// Mock upstream that captures the request's header block, drains the
+    /// declared body, and returns 200.
+    async fn capturing_upstream() -> (u16, oneshot::Receiver<String>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<String>();
+        let handle = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            let head_end = loop {
+                let n = conn.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end - 4]).into_owned();
+            let content_len: usize = head
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("content-length:")
+                        .map(|v| v.trim().to_string())
+                })
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            // Drain the body so reqwest's upload completes cleanly.
+            let mut body_read = buf.len() - head_end;
+            while body_read < content_len {
+                let n = conn.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                body_read += n;
+            }
+            let _ = tx.send(head);
+            conn.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"result\":\"ok\"}"
+            ).await.unwrap();
+        });
+        (port, rx, handle)
+    }
+
+    #[tokio::test]
+    async fn outbound_request_carries_content_length() {
+        let (mock_port, head_rx, mock_handle) = capturing_upstream().await;
+        let state = test_state_with_upstream(mock_port);
+        let (addr, _tx, _server) = start_server(state);
+
+        // Large enough that the pre-fix code streamed it chunked (dropping
+        // Content-Length); the sized body must now declare an exact length.
+        let big = "x".repeat(512 * 1024);
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "content": big}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let head = tokio::time::timeout(Duration::from_secs(5), head_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(
+            head.contains("content-length:"),
+            "outbound request must carry Content-Length:\n{head}"
+        );
+        assert!(
+            !head.contains("transfer-encoding: chunked"),
+            "outbound request must not be chunked:\n{head}"
+        );
+
+        mock_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn permits_restored_after_forward() {
+        let (mock_port, mock_handle) = instant_upstream(1).await;
+        let state = test_state_with_upstream(mock_port);
+        let total = state.budget.permits();
+        let (addr, _tx, _server) = start_server(state.clone());
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // The permit lives in the outbound body and is released when the
+        // upload completes, so the budget returns whole — no leak.
+        let mut waited = 0;
+        while state.budget.available_permits() != total && waited < 50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+        assert_eq!(state.budget.available_permits(), total);
+
+        mock_handle.abort();
+    }
+
+    /// Mock upstream that declares a body far larger than it sends.
+    async fn oversized_response_upstream() -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = conn.read(&mut buf).await.unwrap();
+            let _ = conn
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n",
+                )
+                .await;
+            let _ = conn.write_all(&vec![b'x'; 1024]).await;
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn oversized_nonstreaming_response_rejected() {
+        // 4 KB budget → 4 KB response cap; the 1 MB response can't be buffered.
+        let (mock_port, mock_handle) = oversized_response_upstream().await;
+        let state = test_state_with_budget(mock_port, 4);
+        let stats_index = state
+            .model_map
+            .get("fast")
+            .unwrap()
+            .first()
+            .unwrap()
+            .stats_index;
+        let (addr, _tx, _server) = start_server(state.clone());
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "fast", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+
+        // The over-cap response surfaces as an upstream error, not a giant buffer.
+        assert_eq!(resp.status(), 502);
+        assert!(
+            state.tracker.stats(stats_index).success_rate() < 1.0,
+            "an oversized response must feed the error signal"
         );
 
         mock_handle.abort();

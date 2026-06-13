@@ -1,5 +1,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod body;
 pub mod config;
 pub mod gcp_auth;
 pub mod metrics;

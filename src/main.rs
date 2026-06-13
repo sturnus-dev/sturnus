@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use llmrouter::gcp_auth::GcpTokenProvider;
 use llmrouter::metrics::Metrics;
 use llmrouter::model_map::{ModelMap, ProviderKind};
 use llmrouter::router::RoundRobinState;
-use llmrouter::server::AppState;
+use llmrouter::server::{AppState, BufferBudget};
 use llmrouter::tracker::Tracker;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(10)
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(
             config.routing.connect_timeout_secs,
         ))
@@ -138,7 +139,25 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let exploit_k = config.routing.exploit_k;
-    let max_body_bytes = config.routing.max_body_bytes;
+
+    let (budget_bytes, budget_source) = config.routing.buffer_budget_bytes();
+    let configured_max_body = config.routing.max_body_bytes;
+    let budget = BufferBudget::new(budget_bytes, configured_max_body);
+    info!(
+        budget_mb = budget.permits() / 1024,
+        source = budget_source,
+        "aggregate request buffer budget"
+    );
+    // A per-request cap above the aggregate budget is a request that can
+    // never be admitted; BufferBudget clamps it so "fits the cap" means
+    // "can ever fit".
+    if budget.max_body_bytes < configured_max_body {
+        warn!(
+            configured_mb = configured_max_body / 1024 / 1024,
+            clamped_mb = budget.max_body_bytes / 1024 / 1024,
+            "max_body_bytes exceeds the buffer budget; clamping the per-request cap to the budget"
+        );
+    }
 
     let metrics = Metrics::new();
     let label_triples: Vec<(&str, &str, &str)> = model_map
@@ -156,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
         client,
         exploit_k,
         gcp_token_provider,
-        max_body_bytes,
+        budget,
         metrics,
         shutting_down: AtomicBool::new(false),
     });

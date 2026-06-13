@@ -2,7 +2,7 @@
 #![allow(clippy::expect_used)]
 
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
 };
 
 pub struct Metrics {
@@ -13,6 +13,8 @@ pub struct Metrics {
     /// Non-streaming full response time.
     pub latency_seconds: HistogramVec,
     pub errors_total: IntCounterVec,
+    /// Requests shed with 429 because the aggregate buffer budget was full.
+    pub buffer_rejections_total: IntCounter,
 }
 
 impl std::fmt::Debug for Metrics {
@@ -69,6 +71,12 @@ impl Metrics {
         )
         .expect("valid metric descriptor");
 
+        let buffer_rejections_total = IntCounter::new(
+            "llmrouter_buffer_rejections_total",
+            "Requests rejected because the aggregate buffer budget was full",
+        )
+        .expect("valid metric descriptor");
+
         registry
             .register(Box::new(requests_total.clone()))
             .expect("unique metric name");
@@ -81,6 +89,9 @@ impl Metrics {
         registry
             .register(Box::new(errors_total.clone()))
             .expect("unique metric name");
+        registry
+            .register(Box::new(buffer_rejections_total.clone()))
+            .expect("unique metric name");
 
         Self {
             registry,
@@ -88,6 +99,7 @@ impl Metrics {
             ttfc_seconds,
             latency_seconds,
             errors_total,
+            buffer_rejections_total,
         }
     }
 

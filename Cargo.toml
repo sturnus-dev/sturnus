@@ -1,6 +1,6 @@
 [package]
 name = "llmrouter"
-version = "4.2.0"
+version = "4.3.0"
 edition = "2021"
 authors = ["Danny Boland <danny@boland.dev>"]
 license = "MIT"
@@ -10,9 +10,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
 http-body-util = "0.1"
-reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls-no-provider", "http2"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
@@ -29,6 +29,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 tempfile = "3"
+# Memory regression test only: precise live-heap readings via stats::allocated.
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats"] }
 
 [lints.rust]
 # No unsafe in this codebase; keep it that way.

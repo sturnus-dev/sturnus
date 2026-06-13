@@ -65,38 +65,25 @@ impl CandidateStats {
 
     pub fn record_outcome(&self, success: bool, alpha: f64) {
         let sample = if success { 1.0 } else { 0.0 };
-        let mut current = self.success_rate.load(Ordering::Relaxed);
-        loop {
-            let blended = alpha * sample + (1.0 - alpha) * f64::from_bits(current);
-            match self.success_rate.compare_exchange_weak(
-                current,
-                blended.to_bits(),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(observed) => current = observed, // another thread updated; retry
-            }
-        }
+        let _ = self
+            .success_rate
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some((alpha * sample + (1.0 - alpha) * f64::from_bits(current)).to_bits())
+            });
     }
 
     pub fn update_ewma(&self, mode: LatencyMode, observed_ms: u64, alpha: f64) {
-        let field = self.ewma_field(mode);
-        loop {
-            let old = field.load(Ordering::Relaxed);
-            // EWMA of positive millis; rounds to a bounded non-negative u64.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let new_val = if old == u64::MAX {
-                observed_ms
-            } else {
-                let new_f = alpha * observed_ms as f64 + (1.0 - alpha) * old as f64;
-                new_f.round() as u64
-            };
-            match field.compare_exchange_weak(old, new_val, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(_) => continue, // another thread updated; retry with fresh value
-            }
-        }
+        let _ = self
+            .ewma_field(mode)
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                // EWMA of positive millis; rounds to a bounded non-negative u64.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                Some(if old == u64::MAX {
+                    observed_ms
+                } else {
+                    (alpha * observed_ms as f64 + (1.0 - alpha) * old as f64).round() as u64
+                })
+            });
     }
 }
 

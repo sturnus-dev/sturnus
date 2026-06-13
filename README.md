@@ -49,6 +49,8 @@ response = client.chat.completions.create(
 - **Latency- and error-aware routing** — proportional weighting by *effective latency* per (provider, model): the latency EWMA divided by the success-rate EWMA, i.e. the expected time per successful response. The best candidate gets the bulk of traffic while slower or erroring ones keep a small, shrinking share. That share doubles as a probe, so a provider that recovers wins traffic back automatically — no winner-take-all oscillation, no thresholds to trip or age out.
 - **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback when the pinned candidate's error rate breaches `error_threshold`.
 - **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive, with no buffering.
+- **Memory-bounded** — request buffers are capped per request and in aggregate; the aggregate budget is auto-sized from the container's cgroup memory limit, and bursts beyond it shed load with `429` + `Retry-After` instead of OOMing the pod. The request body is forwarded with its `Content-Length` and freed as soon as the upload completes.
+- **HTTP/2 to providers** — negotiated via ALPN with automatic HTTP/1.1 fallback, so concurrent requests multiplex over one connection instead of churning the pool.
 - **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
 - **Zero infrastructure** — a single static binary; no Redis, database, or control plane.
 
@@ -161,6 +163,7 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 | `llmrouter_ttfc_seconds` | histogram | Streaming time-to-first-chunk (streaming requests only) |
 | `llmrouter_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
 | `llmrouter_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
+| `llmrouter_buffer_rejections_total` | counter | Requests shed with `429` because the aggregate buffer budget was full (no per-alias labels) |
 
 Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".
 
@@ -207,7 +210,7 @@ The best provider is exploited heavily while worse ones keep enough traffic to s
 
 ## Why llmrouter
 
-Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. llmrouter is deliberately the opposite — **a single static binary, not a platform**: a Rust codebase you can read in an afternoon, with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API and forwards requests largely untouched, so any OpenAI-compatible SDK works by changing one base URL.
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. llmrouter is deliberately the opposite — **a single static binary, not a platform**: a Rust codebase you can read in an afternoon, with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. To rewrite the `model` field, each request body is buffered (capped at 32 MB by default) and validated as JSON — but only `model` is touched: every other field is forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE streams, are relayed untouched.
 
 If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — llmrouter is intentionally not that.
 
@@ -224,6 +227,8 @@ llmrouter has a bounded scope by design and has some deliberate omissions:
 ## Docker
 
 When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
+
+Memory needs no tuning: the aggregate request-buffer budget defaults to half the container's memory limit (read from cgroups at startup, logged with its source), so a small sidecar sheds excess load with `429`s rather than getting OOM-killed. Override with `routing.max_buffered_bytes` if you want a different ceiling.
 
 The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/dannyboland/llmrouter`. Tags follow semver: `:latest`, `:4.0`, `:4.0.0`.
 
