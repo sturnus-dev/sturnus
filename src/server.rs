@@ -375,7 +375,7 @@ pub async fn handle_request(
             *resp.status_mut() = proxy_result.status;
             let headers = resp.headers_mut();
             headers.extend(proxy_result.headers);
-            headers.insert("x-llmrouter-provider", candidate.provider_header.clone());
+            headers.insert("x-sturnus-provider", candidate.provider_header.clone());
             headers.insert("x-session-affinity", candidate.affinity_header.clone());
             Ok(resp)
         }

@@ -17,10 +17,10 @@ Steps, plus the relevant config (redact API keys) and the request you sent.
 ```
 
 **Logs**
-Relevant log lines. Run with `RUST_LOG=llmrouter=debug` for more detail, and redact any secrets.
+Relevant log lines. Run with `RUST_LOG=sturnus=debug` for more detail, and redact any secrets.
 
 **Environment**
-- llmrouter version (`llmrouter --version` or image tag):
+- sturnus version (`sturnus --version` or image tag):
 - How you're running it (Docker / binary / Kubernetes sidecar):
 - OS / architecture:
 

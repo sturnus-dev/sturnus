@@ -10,11 +10,11 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-use llmrouter::metrics::Metrics;
-use llmrouter::model_map::ModelMap;
-use llmrouter::router::RoundRobinState;
-use llmrouter::server::{run_server, AppState, BufferBudget};
-use llmrouter::tracker::{LatencyMode, Tracker};
+use sturnus::metrics::Metrics;
+use sturnus::model_map::ModelMap;
+use sturnus::router::RoundRobinState;
+use sturnus::server::{run_server, AppState, BufferBudget};
+use sturnus::tracker::{LatencyMode, Tracker};
 
 mod common;
 
@@ -23,8 +23,8 @@ fn test_state_with_upstream(upstream_port: u16) -> Arc<AppState> {
 }
 
 fn test_state_with_budget(upstream_port: u16, budget_kb: usize) -> Arc<AppState> {
-    llmrouter::init_crypto();
-    let config: llmrouter::config::Config = toml::from_str(&format!(
+    sturnus::init_crypto();
+    let config: sturnus::config::Config = toml::from_str(&format!(
         r#"
 [provider.test]
 base_url = "http://127.0.0.1:{upstream_port}"
@@ -227,10 +227,10 @@ async fn metrics_endpoint_returns_prometheus_text() {
         "expected text/plain content-type, got {content_type}"
     );
     let body = resp.text().await.unwrap();
-    assert!(body.contains("llmrouter_requests_total"));
-    assert!(body.contains("llmrouter_ttfc_seconds"));
-    assert!(body.contains("llmrouter_latency_seconds"));
-    assert!(body.contains("llmrouter_errors_total"));
+    assert!(body.contains("sturnus_requests_total"));
+    assert!(body.contains("sturnus_ttfc_seconds"));
+    assert!(body.contains("sturnus_latency_seconds"));
+    assert!(body.contains("sturnus_errors_total"));
 }
 
 #[tokio::test]
@@ -331,7 +331,7 @@ async fn hanging_upstream() -> (u16, tokio::task::JoinHandle<()>) {
 fn proxy_request(
     addr: std::net::SocketAddr,
 ) -> tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>> {
-    llmrouter::init_crypto();
+    sturnus::init_crypto();
     tokio::spawn(async move {
         reqwest::Client::new()
             .post(format!("http://{addr}/v1/chat/completions"))
@@ -489,12 +489,12 @@ async fn response_includes_session_affinity_header() {
 
 #[tokio::test]
 async fn affinity_header_pins_to_candidate() {
-    llmrouter::init_crypto();
+    sturnus::init_crypto();
     // Two distinct upstreams for the same model alias
     let (port_a, handle_a) = instant_upstream(1).await;
     let (port_b, handle_b) = instant_upstream(0).await;
 
-    let config: llmrouter::config::Config = toml::from_str(&format!(
+    let config: sturnus::config::Config = toml::from_str(&format!(
         r#"
 [provider.alpha]
 base_url = "http://127.0.0.1:{port_a}"
@@ -570,7 +570,7 @@ fast = [
     assert_eq!(resp.status(), 200);
     let provider = resp
         .headers()
-        .get("x-llmrouter-provider")
+        .get("x-sturnus-provider")
         .unwrap()
         .to_str()
         .unwrap();
@@ -585,13 +585,13 @@ fast = [
 
 #[tokio::test]
 async fn affinity_pin_broken_when_error_ewma_breaches_threshold() {
-    llmrouter::init_crypto();
+    sturnus::init_crypto();
     let (port_a, handle_a) = instant_upstream(0).await;
     let (port_b, handle_b) = instant_upstream(1).await;
 
     // beta listed first: the first Weyl tick lands on the first weight
     // unit, which would be alpha's probe slice otherwise.
-    let config: llmrouter::config::Config = toml::from_str(&format!(
+    let config: sturnus::config::Config = toml::from_str(&format!(
         r#"
 [provider.alpha]
 base_url = "http://127.0.0.1:{port_a}"
@@ -668,7 +668,7 @@ fast = [
     assert_eq!(resp.status(), 200);
     let provider = resp
         .headers()
-        .get("x-llmrouter-provider")
+        .get("x-sturnus-provider")
         .unwrap()
         .to_str()
         .unwrap();

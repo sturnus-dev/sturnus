@@ -34,7 +34,7 @@ impl Metrics {
         let registry = Registry::new();
 
         let requests_total = IntCounterVec::new(
-            Opts::new("llmrouter_requests_total", "Total upstream requests"),
+            Opts::new("sturnus_requests_total", "Total upstream requests"),
             &["alias", "provider", "model", "status_code"],
         )
         .expect("valid metric descriptor");
@@ -44,7 +44,7 @@ impl Metrics {
 
         let ttfc_seconds = HistogramVec::new(
             HistogramOpts::new(
-                "llmrouter_ttfc_seconds",
+                "sturnus_ttfc_seconds",
                 "Streaming time-to-first-chunk from upstream",
             )
             .buckets(latency_buckets.clone()),
@@ -54,7 +54,7 @@ impl Metrics {
 
         let latency_seconds = HistogramVec::new(
             HistogramOpts::new(
-                "llmrouter_latency_seconds",
+                "sturnus_latency_seconds",
                 "Non-streaming full response time from upstream",
             )
             .buckets(latency_buckets),
@@ -64,7 +64,7 @@ impl Metrics {
 
         let errors_total = IntCounterVec::new(
             Opts::new(
-                "llmrouter_errors_total",
+                "sturnus_errors_total",
                 "Connection failures before reaching upstream",
             ),
             &["alias", "provider", "model"],
@@ -72,7 +72,7 @@ impl Metrics {
         .expect("valid metric descriptor");
 
         let buffer_rejections_total = IntCounter::new(
-            "llmrouter_buffer_rejections_total",
+            "sturnus_buffer_rejections_total",
             "Requests rejected because the aggregate buffer budget was full",
         )
         .expect("valid metric descriptor");
@@ -141,10 +141,10 @@ mod tests {
             .inc();
 
         let output = String::from_utf8(m.encode().unwrap()).unwrap();
-        assert!(output.contains("llmrouter_requests_total"));
-        assert!(output.contains("llmrouter_ttfc_seconds"));
-        assert!(output.contains("llmrouter_latency_seconds"));
-        assert!(output.contains("llmrouter_errors_total"));
+        assert!(output.contains("sturnus_requests_total"));
+        assert!(output.contains("sturnus_ttfc_seconds"));
+        assert!(output.contains("sturnus_latency_seconds"));
+        assert!(output.contains("sturnus_errors_total"));
         assert!(output.contains("alias=\"fast\""));
         assert!(output.contains("provider=\"openai\""));
         assert!(output.contains("status_code=\"200\""));

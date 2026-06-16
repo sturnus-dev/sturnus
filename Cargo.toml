@@ -1,5 +1,5 @@
 [package]
-name = "llmrouter"
+name = "sturnus"
 version = "4.3.0"
 edition = "2021"
 authors = ["Danny Boland <danny@boland.dev>"]

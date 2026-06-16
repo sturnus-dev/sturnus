@@ -1,12 +1,12 @@
-# llmrouter
+# sturnus
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![GitHub Release](https://img.shields.io/github/v/release/dannyboland/llmrouter)](https://github.com/dannyboland/llmrouter/releases)
-[![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fdannyboland%2Fllmrouter-blue?logo=docker)](https://ghcr.io/dannyboland/llmrouter)
+[![GitHub Release](https://img.shields.io/github/v/release/sturnus-dev/sturnus)](https://github.com/sturnus-dev/sturnus/releases)
+[![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fsturnus-dev%2Fsturnus-blue?logo=docker)](https://ghcr.io/sturnus-dev/sturnus)
 
 **Automatic latency-based routing across LLM providers. A single static binary, zero infrastructure.**
 
-LLM providers have variable latency and availability that can break production features. llmrouter is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
+LLM providers have variable latency and availability that can break production features. sturnus is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
 
 
 ## Quick start
@@ -16,19 +16,19 @@ LLM providers have variable latency and availability that can break production f
 ```bash
 docker run -v ./config.toml:/config.toml \
   -p 4000:4000 \
-  ghcr.io/dannyboland/llmrouter:latest
+  ghcr.io/sturnus-dev/sturnus:latest
 ```
 
 **Pre-built binary** — best for CI, scripting, or running without Docker:
 
 ```bash
 # Linux (x86_64) — also available for aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
-curl -fsSL https://github.com/dannyboland/llmrouter/releases/latest/download/llmrouter-x86_64-unknown-linux-musl -o llmrouter
-chmod +x llmrouter
-./llmrouter --config config.toml
+curl -fsSL https://github.com/sturnus-dev/sturnus/releases/latest/download/sturnus-x86_64-unknown-linux-musl -o sturnus
+chmod +x sturnus
+./sturnus --config config.toml
 ```
 
-Then point any OpenAI-compatible SDK at llmrouter — the only change is the base URL:
+Then point any OpenAI-compatible SDK at sturnus — the only change is the base URL:
 
 ```diff
 - client = OpenAI(base_url="https://api.openai.com/v1", api_key="sk-...")
@@ -39,7 +39,7 @@ Then point any OpenAI-compatible SDK at llmrouter — the only change is the bas
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="fast",  # resolved by llmrouter to lowest-latency candidate
+    model="fast",  # resolved by sturnus to lowest-latency candidate
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
@@ -61,7 +61,7 @@ response = client.chat.completions.create(
 - [Observability](#observability)
 - [Session affinity](#session-affinity)
 - [How routing works](#how-routing-works)
-- [Why llmrouter](#why-llmrouter)
+- [Why sturnus](#why-sturnus)
 - [Docker](#docker)
 - [Performance](#performance)
 - [Building](#building)
@@ -119,13 +119,13 @@ error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin 
 Environment variables in `${VAR}` syntax are interpolated at config load time. Where they're available in an `.env` file (`KEY=VALUE` per line), pass it with `--env-file`:
 
 ```bash
-llmrouter --env-file /secrets/.env
+sturnus --env-file /secrets/.env
 ```
 
 <details>
 <summary><b>Vertex billing attribution</b></summary>
 
-For Vertex providers, llmrouter can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:
+For Vertex providers, sturnus can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:
 
 ```toml
 [attribution]
@@ -159,17 +159,17 @@ Prometheus metrics on `/metrics`, all labelled by `alias`, `provider`, `model`:
 
 | Metric | Type | Meaning |
 |--------|------|---------|
-| `llmrouter_requests_total` | counter | Completed responses, additionally labelled by `status_code` (includes upstream 4xx/5xx) |
-| `llmrouter_ttfc_seconds` | histogram | Streaming time-to-first-chunk (streaming requests only) |
-| `llmrouter_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
-| `llmrouter_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
-| `llmrouter_buffer_rejections_total` | counter | Requests shed with `429` because the aggregate buffer budget was full (no per-alias labels) |
+| `sturnus_requests_total` | counter | Completed responses, additionally labelled by `status_code` (includes upstream 4xx/5xx) |
+| `sturnus_ttfc_seconds` | histogram | Streaming time-to-first-chunk (streaming requests only) |
+| `sturnus_latency_seconds` | histogram | Non-streaming full response time (non-streaming requests only) |
+| `sturnus_errors_total` | counter | Transport failures that never produced a response (timeout, connect, DNS) |
+| `sturnus_buffer_rejections_total` | counter | Requests shed with `429` because the aggregate buffer budget was full (no per-alias labels) |
 
 Connection failures are zero-initialised at startup so a missing series is never mistaken for "no errors".
 
 ### Logging
 
-Structured logging via `tracing`: human-readable and coloured on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Override with `--log-format <auto|pretty|json>` or `LLMROUTER_LOG_FORMAT`; filter with `RUST_LOG` (default `llmrouter=info`).
+Structured logging via `tracing`: human-readable and coloured on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Override with `--log-format <auto|pretty|json>` or `STURNUS_LOG_FORMAT`; filter with `RUST_LOG` (default `sturnus=info`).
 
 Every request is wrapped in a span carrying a `request_id` that correlates all log lines for that request; when the client sends a W3C `traceparent`, the `trace_id` and `parent_span_id` are attached too. Notable events at the default `info` level and above:
 
@@ -208,19 +208,19 @@ Fully stateless — works across pods with no shared state. The pin is honored u
 
 The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
 
-## Why llmrouter
+## Why sturnus
 
-Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. llmrouter is deliberately the opposite — **a single static binary, not a platform**: a Rust codebase you can read in an afternoon, with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. To rewrite the `model` field, each request body is buffered (capped at 32 MB by default) and validated as JSON — but only `model` is touched: every other field is forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE streams, are relayed untouched.
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is deliberately the opposite — **a single static binary, not a platform**: a Rust codebase you can read in an afternoon, with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. To rewrite the `model` field, each request body is buffered (capped at 32 MB by default) and validated as JSON — but only `model` is touched: every other field is forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE streams, are relayed untouched.
 
-If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — llmrouter is intentionally not that.
+If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — sturnus is intentionally not that.
 
 <details>
 <summary><b>Design choices &amp; deliberate omissions</b></summary>
 
-llmrouter has a bounded scope by design and has some deliberate omissions:
+sturnus has a bounded scope by design and has some deliberate omissions:
 
-- **No request-level failover or retries.** llmrouter is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let llmrouter steer those retries toward the healthiest provider.
-- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. llmrouter never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
+- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let sturnus steer those retries toward the healthiest provider.
+- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. sturnus never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
 
 </details>
 
@@ -230,7 +230,7 @@ When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"`
 
 Memory needs no tuning: the aggregate request-buffer budget defaults to half the container's memory limit (read from cgroups at startup, logged with its source), so a small sidecar sheds excess load with `429`s rather than getting OOM-killed. Override with `routing.max_buffered_bytes` if you want a different ceiling.
 
-The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/dannyboland/llmrouter`. Tags follow semver: `:latest`, `:4.0`, `:4.0.0`.
+The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/sturnus-dev/sturnus`. Tags follow semver: `:latest`, `:4.0`, `:4.0.0`.
 
 To inject secrets via a mounted `.env` file:
 
@@ -238,7 +238,7 @@ To inject secrets via a mounted `.env` file:
 docker run -v ./config.toml:/config.toml \
   -v ./secrets.env:/secrets/.env:ro \
   -p 4000:4000 \
-  ghcr.io/dannyboland/llmrouter:latest --env-file /secrets/.env
+  ghcr.io/sturnus-dev/sturnus:latest --env-file /secrets/.env
 ```
 
 <details>
@@ -253,7 +253,7 @@ docker run -v ./config.toml:/config.toml \
   -v ./sa-key.json:/sa-key.json:ro \
   -e GOOGLE_APPLICATION_CREDENTIALS=/sa-key.json \
   -p 4000:4000 \
-  ghcr.io/dannyboland/llmrouter:latest
+  ghcr.io/sturnus-dev/sturnus:latest
 ```
 
 Or gcloud ADC for local dev, mounted to `$HOME/.config/gcloud/` (the image sets `HOME=/root`):
@@ -262,14 +262,14 @@ Or gcloud ADC for local dev, mounted to `$HOME/.config/gcloud/` (the image sets 
 docker run -v ./config.toml:/config.toml \
   -v ~/.config/gcloud/application_default_credentials.json:/root/.config/gcloud/application_default_credentials.json:ro \
   -p 4000:4000 \
-  ghcr.io/dannyboland/llmrouter:latest
+  ghcr.io/sturnus-dev/sturnus:latest
 ```
 
 </details>
 
 ## Performance
 
-llmrouter's own overhead is negligible next to the hundreds of milliseconds, or even many seconds, of provider latency it routes around. It's a thin Rust proxy in the hot path, not a platform. If you want to measure it yourself, the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) is a reasonable methodology.
+sturnus's own overhead is negligible next to the hundreds of milliseconds, or even many seconds, of provider latency it routes around. It's a thin Rust proxy in the hot path, not a platform. If you want to measure it yourself, the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) is a reasonable methodology.
 
 ## Building
 

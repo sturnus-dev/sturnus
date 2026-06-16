@@ -15,11 +15,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use llmrouter::metrics::Metrics;
-use llmrouter::model_map::ModelMap;
-use llmrouter::router::RoundRobinState;
-use llmrouter::server::{run_server, AppState, BufferBudget};
-use llmrouter::tracker::Tracker;
+use sturnus::metrics::Metrics;
+use sturnus::model_map::ModelMap;
+use sturnus::router::RoundRobinState;
+use sturnus::server::{run_server, AppState, BufferBudget};
+use sturnus::tracker::Tracker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -69,7 +69,7 @@ async fn send_large_request(addr: std::net::SocketAddr) {
 
     let mut socket = TcpStream::connect(addr).await.unwrap();
     let head = format!(
-        "POST /v1/chat/completions HTTP/1.1\r\nhost: llmrouter\r\ncontent-type: application/json\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n"
+        "POST /v1/chat/completions HTTP/1.1\r\nhost: sturnus\r\ncontent-type: application/json\r\ncontent-length: {total}\r\nconnection: close\r\n\r\n"
     );
     socket.write_all(head.as_bytes()).await.unwrap();
     socket.write_all(prefix).await.unwrap();
@@ -88,8 +88,8 @@ async fn send_large_request(addr: std::net::SocketAddr) {
 }
 
 fn router_state(upstream_port: u16) -> Arc<AppState> {
-    llmrouter::init_crypto();
-    let config: llmrouter::config::Config = toml::from_str(&format!(
+    sturnus::init_crypto();
+    let config: sturnus::config::Config = toml::from_str(&format!(
         r#"
 [provider.test]
 base_url = "http://127.0.0.1:{upstream_port}"

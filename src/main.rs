@@ -7,12 +7,12 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use llmrouter::gcp_auth::GcpTokenProvider;
-use llmrouter::metrics::Metrics;
-use llmrouter::model_map::{ModelMap, ProviderKind};
-use llmrouter::router::RoundRobinState;
-use llmrouter::server::{AppState, BufferBudget};
-use llmrouter::tracker::Tracker;
+use sturnus::gcp_auth::GcpTokenProvider;
+use sturnus::metrics::Metrics;
+use sturnus::model_map::{ModelMap, ProviderKind};
+use sturnus::router::RoundRobinState;
+use sturnus::server::{AppState, BufferBudget};
+use sturnus::tracker::Tracker;
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum LogFormat {
@@ -23,7 +23,7 @@ enum LogFormat {
 }
 
 #[derive(Parser)]
-#[command(name = "llmrouter", about = "Lightweight LLM load-balancing sidecar")]
+#[command(name = "sturnus", about = "Lightweight LLM load-balancing sidecar")]
 struct Cli {
     /// Path to config TOML file
     #[arg(short, long, default_value = "config.toml")]
@@ -38,7 +38,7 @@ struct Cli {
     env_dir: Option<PathBuf>,
 
     /// Log output format
-    #[arg(long, value_enum, default_value = "auto", env = "LLMROUTER_LOG_FORMAT")]
+    #[arg(long, value_enum, default_value = "auto", env = "STURNUS_LOG_FORMAT")]
     log_format: LogFormat,
 }
 
@@ -53,14 +53,14 @@ fn print_banner() {
          \x20     ┌► llm\n\
          \x20  ►──┼► llm\n\
          \x20     └► llm\n\
-         \x20  llmrouter v{}\n",
+         \x20  sturnus v{}\n",
         env!("CARGO_PKG_VERSION")
     );
 }
 
 fn init_logging(format: LogFormat) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("llmrouter=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("sturnus=info"));
     let json = match format {
         LogFormat::Json => true,
         LogFormat::Pretty => false,
@@ -87,21 +87,21 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.log_format);
     print_banner();
-    llmrouter::init_crypto();
+    sturnus::init_crypto();
 
     if let Some(ref env_path) = cli.env_file {
-        llmrouter::config::Config::load_env_file(env_path)?;
+        sturnus::config::Config::load_env_file(env_path)?;
         info!(path = %env_path.display(), "loaded env file");
     }
 
     if let Some(ref env_dir) = cli.env_dir {
-        llmrouter::config::Config::load_env_dir(env_dir)?;
+        sturnus::config::Config::load_env_dir(env_dir)?;
         info!(path = %env_dir.display(), "loaded env dir");
     }
 
-    let config = llmrouter::config::Config::load(&cli.config)?;
+    let config = sturnus::config::Config::load(&cli.config)?;
 
-    info!(listen = %config.listen, "starting llmrouter");
+    info!(listen = %config.listen, "starting sturnus");
     info!(
         providers = config.provider.len(),
         models = config.model.len(),
@@ -196,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
         info!("received shutdown signal");
     };
 
-    llmrouter::server::run_server(listener, state, shutdown, shutdown_timeout).await;
+    sturnus::server::run_server(listener, state, shutdown, shutdown_timeout).await;
 
     info!("server stopped");
     Ok(())

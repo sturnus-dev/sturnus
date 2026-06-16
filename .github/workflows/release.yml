@@ -51,11 +51,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/llmrouter llmrouter-${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/sturnus sturnus-${{ matrix.target }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.target }}
-          path: llmrouter-${{ matrix.target }}
+          path: sturnus-${{ matrix.target }}
 
   image:
     needs: [validate, test]
@@ -74,8 +74,8 @@ jobs:
         with:
           pattern: binary-*
           merge-multiple: true
-      - run: chmod +x llmrouter-*
+      - run: chmod +x sturnus-*
       - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           generate_release_notes: true
-          files: llmrouter-*
+          files: sturnus-*

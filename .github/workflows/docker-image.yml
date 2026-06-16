@@ -31,11 +31,11 @@ jobs:
           key: ${{ matrix.target }}
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: cp target/${{ matrix.target }}/release/llmrouter llmrouter-${{ matrix.target }}
+      - run: cp target/${{ matrix.target }}/release/sturnus sturnus-${{ matrix.target }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binary-${{ matrix.target }}
-          path: llmrouter-${{ matrix.target }}
+          path: sturnus-${{ matrix.target }}
 
   docker:
     needs: build-linux
@@ -47,9 +47,9 @@ jobs:
           pattern: binary-*-unknown-linux-musl
           merge-multiple: true
       - run: |
-          chmod +x llmrouter-*
-          mv llmrouter-x86_64-unknown-linux-musl llmrouter-amd64
-          mv llmrouter-aarch64-unknown-linux-musl llmrouter-arm64
+          chmod +x sturnus-*
+          mv sturnus-x86_64-unknown-linux-musl sturnus-amd64
+          mv sturnus-aarch64-unknown-linux-musl sturnus-arm64
       - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
       - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
@@ -60,7 +60,7 @@ jobs:
       - uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         id: meta
         with:
-          images: ghcr.io/${{ github.repository_owner }}/llmrouter
+          images: ghcr.io/${{ github.repository_owner }}/sturnus
           tags: ${{ inputs.tags }}
       - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:

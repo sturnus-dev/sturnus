@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 FROM scratch
 ARG TARGETARCH
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY llmrouter-${TARGETARCH} /llmrouter
+COPY sturnus-${TARGETARCH} /sturnus
 # Give gcp_auth a home to find ADC creds at $HOME/.config/gcloud/ (scratch sets none).
 ENV HOME=/root
-ENTRYPOINT ["/llmrouter"]
+ENTRYPOINT ["/sturnus"]
