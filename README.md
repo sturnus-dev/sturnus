@@ -2,14 +2,15 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/sturnus-dev/sturnus)](https://github.com/sturnus-dev/sturnus/releases)
-[![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fsturnus-dev%2Fsturnus-blue?logo=docker)](https://ghcr.io/sturnus-dev/sturnus)
+[![Docker Image](https://img.shields.io/badge/docker-ghcr.io%2Fsturnus--dev%2Fsturnus-blue?logo=docker)](https://ghcr.io/sturnus-dev/sturnus)
 
 **Automatic latency-based routing across LLM providers. A single static binary, zero infrastructure.**
 
 LLM providers have variable latency and availability that can break production features. sturnus is a lightweight sidecar that sits beside your app, exposes an OpenAI-compatible API, and automatically shifts traffic to whichever provider is fastest and available right now.
 
-
 ## Quick start
+
+sturnus needs a `config.toml` — copy `config.example.toml` and add your providers.
 
 **Docker** — best for production deployments and Kubernetes sidecars:
 
@@ -39,20 +40,35 @@ Then point any OpenAI-compatible SDK at sturnus — the only change is the base 
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="fast",  # resolved by sturnus to lowest-latency candidate
+    model="fast",  # resolved by sturnus to the fastest available candidate
     messages=[{"role": "user", "content": "Hello"}],
 )
 ```
 
 ## Features
 
-- **Latency- and error-aware routing** — proportional weighting by *effective latency* per (provider, model): the latency EWMA divided by the success-rate EWMA, i.e. the expected time per successful response. The best candidate gets the bulk of traffic while slower or erroring ones keep a small, shrinking share. That share doubles as a probe, so a provider that recovers wins traffic back automatically — no winner-take-all oscillation, no thresholds to trip or age out.
-- **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods, with automatic fallback when the pinned candidate's error rate breaches `error_threshold`.
-- **SSE streaming passthrough** — relays `text/event-stream` chunks as they arrive, with no buffering.
-- **Memory-bounded** — request buffers are capped per request and in aggregate; the aggregate budget is auto-sized from the container's cgroup memory limit, and bursts beyond it shed load with `429` + `Retry-After` instead of OOMing the pod. The request body is forwarded with its `Content-Length` and freed as soon as the upload completes.
-- **HTTP/2 to providers** — negotiated via ALPN with automatic HTTP/1.1 fallback, so concurrent requests multiplex over one connection instead of churning the pool.
+- **Latency- and error-aware routing** — the fastest healthy provider gets the bulk of traffic, while slower or erroring ones keep a small, shrinking share. That share doubles as a probe, so a recovered provider wins its traffic back automatically, with no thresholds to trip.
+- **Session affinity** — a stateless `x-session-affinity` header pins follow-up requests to the same provider across pods.
+- **Transparent passthrough** — only the `model` field is rewritten: the request body is otherwise forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE `text/event-stream` chunks, are relayed untouched as they arrive.
+- **Memory-bounded** — request buffers are capped per request and in aggregate; bursts beyond the memory budget shed load with `429` + `Retry-After` instead of OOMing the pod.
 - **Vertex AI support** — GKE Workload Identity auth via the metadata server, with automatic token refresh.
 - **Zero infrastructure** — a single static binary; no Redis, database, or control plane.
+
+## Why sturnus
+
+Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is the opposite — **a single static binary** with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. The core capability of sturnus is automatic latency-based routing across providers — something that most gateways put behind an enterprise tier. Each sidecar routes independently from what it observes locally, so there is no shared state to run.
+
+If you need a full LLMOps platform (spend tracking, prompt management, a UI, dozens of integrations), sturnus is not that.
+
+<details>
+<summary><b>Design choices &amp; deliberate omissions</b></summary>
+
+sturnus has a bounded scope by design and has some deliberate omissions:
+
+- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let sturnus steer those retries toward the healthiest provider.
+- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. sturnus never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
+
+</details>
 
 ## Contents
 
@@ -61,53 +77,28 @@ response = client.chat.completions.create(
 - [Observability](#observability)
 - [Session affinity](#session-affinity)
 - [How routing works](#how-routing-works)
-- [Why sturnus](#why-sturnus)
 - [Docker](#docker)
-- [Performance](#performance)
 - [Building](#building)
 
 ## Configuration
 
 ```toml
-listen = "127.0.0.1:4000"
+# use 127.0.0.1:4000 if running locally rather than in a container
+listen = "0.0.0.0:4000"
 
 # Providers: where to send requests
 [provider.openai]
 base_url = "https://api.openai.com/v1"
 api_key = "${OPENAI_API_KEY}"
 
-[provider.groq]
-base_url = "https://api.groq.com/openai/v1"
-api_key = "${GROQ_API_KEY}"
-
 # Vertex AI via GKE Workload Identity (no API key needed)
 [provider.vertex]
 vertex_ai = { project_id = "my-gcp-project", location = "us-central1" }
 
-# Azure OpenAI
-[provider.azure]
-api_key = "${AZURE_OPENAI_KEY}"
-azure_openai = { resource_name = "my-resource", api_version = "2024-10-21" }
-
-# Google AI Studio
-[provider.gemini]
-api_key = "${GEMINI_API_KEY}"
-google_ai = { api_version = "v1beta" }  # api_version defaults to v1beta
-
-# Anthropic
-[provider.anthropic]
-api_key = "${ANTHROPIC_API_KEY}"
-anthropic = { version = "2023-06-01" }  # version defaults to 2023-06-01
-
 # Model map: aliases the client uses → provider+model candidates
 [model]
 fast = [
-  { provider = "groq", model = "llama-3.3-70b-versatile" },
   { provider = "openai", model = "gpt-4o-mini" },
-]
-
-smart = [
-  { provider = "openai", model = "gpt-4.1" },
   { provider = "vertex", model = "google/gemini-2.5-flash" },
 ]
 
@@ -115,6 +106,8 @@ smart = [
 ewma_alpha = 0.3          # smoothing for the latency and success-rate EWMAs (higher = more reactive)
 error_threshold = 0.5      # error-rate EWMA above which a session-affinity pin is broken (routing weights are unaffected)
 ```
+
+See [`config.example.toml`](config.example.toml) for all providers (Groq, Azure, Google AI Studio, Anthropic, local OpenAI-compatible) and options.
 
 Environment variables in `${VAR}` syntax are interpolated at config load time. Where they're available in an `.env` file (`KEY=VALUE` per line), pass it with `--env-file`:
 
@@ -169,13 +162,9 @@ Connection failures are zero-initialised at startup so a missing series is never
 
 ### Logging
 
-Structured logging via `tracing`: human-readable and coloured on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Override with `--log-format <auto|pretty|json>` or `STURNUS_LOG_FORMAT`; filter with `RUST_LOG` (default `sturnus=info`).
+Structured logging via `tracing`: coloured text on a terminal (respecting `NO_COLOR`), newline-delimited JSON when piped or redirected. Set the format with `--log-format <auto|pretty|json>` (or `STURNUS_LOG_FORMAT`) and the level with `RUST_LOG` (default `sturnus=info`).
 
-Every request is wrapped in a span carrying a `request_id` that correlates all log lines for that request; when the client sends a W3C `traceparent`, the `trace_id` and `parent_span_id` are attached too. Notable events at the default `info` level and above:
-
-- **Upstream error status** (`warn`) — an upstream answered 4xx/5xx; relayed to the client verbatim and logged with the status.
-- **Upstream request failed** (`warn`) — the request never reached the upstream (transport error); returned to the client as `502`.
-- **Stream chunk error** (`warn`) — a streamed response broke partway through.
+Each request gets a span with a `request_id`; a client-supplied W3C `traceparent` propagates as `trace_id` and `parent_span_id` for cross-service correlation.
 
 ## Session affinity
 
@@ -183,13 +172,13 @@ Every response includes an `x-session-affinity` header (e.g. `openai/gpt-4o-mini
 
 ```python
 response = client.chat.completions.create(
-    model="smart",
+    model="fast",
     messages=[{"role": "user", "content": "Hello"}],
 )
 affinity = response.headers["x-session-affinity"]  # e.g. "openai/gpt-4o-mini"
 
 response = client.chat.completions.create(
-    model="smart",
+    model="fast",
     messages=[{"role": "user", "content": "Follow-up"}],
     extra_headers={"x-session-affinity": affinity},
 )
@@ -199,38 +188,24 @@ Fully stateless — works across pods with no shared state. The pin is honored u
 
 ## How routing works
 
-1. Client sends `POST /v1/chat/completions` with `"model": "fast"`
-2. Sidecar looks up the `fast` alias and computes each candidate's **effective latency**: its latency EWMA divided by its success-rate EWMA. A candidate erroring with probability `p` needs ~`1/(1-p)` attempts per success, so errors inflate effective latency the way slowness does — one signal, no separate health state
-3. Each candidate is weighted by `(best_effective / its_effective)^k`, so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks — no RNG, and the long-run split matches the weights without same-candidate bursts
-4. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically, with no winner-take-all herd and no threshold or time window to wait out; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land
-5. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded
-6. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA
+1. Client sends `POST /v1/chat/completions` with `"model": "fast"`.
+2. Sidecar looks up the `fast` alias and computes each candidate's **effective latency**: its latency EWMA divided by its success-rate EWMA. A candidate erroring with probability `p` needs ~`1/(1-p)` attempts per success, so errors inflate effective latency the same way slowness does.
+3. Each candidate is weighted by `(best_effective / its_effective)^k`, so the best gets the bulk of traffic and worse ones a shrinking-but-nonzero share. A deterministic low-discrepancy sequence (golden-ratio Weyl sequence) turns those weights into picks.
+4. Because worse candidates always keep a small share, their EWMAs stay fresh — a provider that recovers (faster responses *or* errors stopping) wins traffic back automatically; a cold candidate (no latency data yet) probes at a quarter of the best candidate's rate, scaled by its success rate, until its first samples land.
+5. The `model` field is rewritten to the real model name, auth headers are set, and the request is forwarded.
+6. TTFC is measured at first chunk arrival and fed back into the EWMA; the response status (any non-2xx counts as an error, including upstream 4xx) feeds the success-rate EWMA.
 
 The best provider is exploited heavily while worse ones keep enough traffic to stay measured. A candidate's probe share shrinks with how bad it looks but is floored at 1%, so re-detecting a recovered provider costs at most ~100 requests — and during an outage at most ~1% of an alias's traffic is spent on the failing candidate.
 
-## Why sturnus
-
-Most LLM gateways are either a hosted SaaS you route all your traffic (and keys) through, or a large application with a significant surface area. sturnus is deliberately the opposite — **a single static binary, not a platform**: a Rust codebase you can read in an afternoon, with a small auditable surface area, MIT-licensed and running entirely inside your infrastructure. It speaks the OpenAI API, so any OpenAI-compatible SDK works by changing one base URL. To rewrite the `model` field, each request body is buffered (capped at 32 MB by default) and validated as JSON — but only `model` is touched: every other field is forwarded byte-for-byte, preserving key order, number precision, and formatting. Responses, including SSE streams, are relayed untouched.
-
-If you need a full LLMOps platform — spend tracking, prompt management, a UI, dozens of integrations — sturnus is intentionally not that.
-
-<details>
-<summary><b>Design choices &amp; deliberate omissions</b></summary>
-
-sturnus has a bounded scope by design and has some deliberate omissions:
-
-- **No request-level failover or retries.** sturnus is a transparent proxy: it surfaces upstream errors to the client verbatim rather than silently retrying within a black box. Error responses still feed the routing signal, so a flaky provider is quickly deprioritized for subsequent traffic — but the individual failed request is returned as-is. Client SDKs (OpenAI, Anthropic, LangChain, etc.) already ship mature, configurable retry and backoff; configure it there and let sturnus steer those retries toward the healthiest provider.
-- **Latency-based, not cost or quality-based.** Routing optimizes time-to-first-chunk *within an alias*, and every model routed under that alias should be largely interchangeable. sturnus never trades quality or cost for speed — it just picks the fastest among options you've already deemed equivalent.
-
-</details>
-
 ## Docker
 
-When running in Docker or as a Kubernetes sidecar, set `listen = "0.0.0.0:4000"` in your config — the default `127.0.0.1` only accepts connections from within the container itself.
+When running in Docker or as a Kubernetes sidecar, `listen` must be `0.0.0.0:4000` (the value in `config.example.toml`) — `127.0.0.1` only accepts connections from within the container itself.
+
+On Kubernetes, run sturnus as a [native sidecar](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/) — an init container with `restartPolicy: Always` (stable since v1.29). It then starts before the app container and is terminated after it, so the proxy is ready for the app's first request and stays up while the app drains.
 
 Memory needs no tuning: the aggregate request-buffer budget defaults to half the container's memory limit (read from cgroups at startup, logged with its source), so a small sidecar sheds excess load with `429`s rather than getting OOM-killed. Override with `routing.max_buffered_bytes` if you want a different ceiling.
 
-The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/sturnus-dev/sturnus`. Tags follow semver: `:latest`, `:4.0`, `:4.0.0`.
+The image is published as a multi-arch (amd64/arm64) scratch container to `ghcr.io/sturnus-dev/sturnus`. Tags follow semver: `:latest`, `:5.0`, `:5.0.0`.
 
 To inject secrets via a mounted `.env` file:
 
@@ -266,10 +241,6 @@ docker run -v ./config.toml:/config.toml \
 ```
 
 </details>
-
-## Performance
-
-sturnus's own overhead is negligible next to the hundreds of milliseconds, or even many seconds, of provider latency it routes around. It's a thin Rust proxy in the hot path, not a platform. If you want to measure it yourself, the [Ferro Labs AI gateway benchmark](https://github.com/ferro-labs/ai-gateway-performance-benchmarks) is a reasonable methodology.
 
 ## Building
 
