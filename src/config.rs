@@ -152,15 +152,9 @@ pub struct RoutingConfig {
     /// `(best_effective / its_effective)^exploit_k`, where effective latency
     /// is the latency EWMA over the success-rate EWMA. Rarely needs changing.
     pub exploit_k: f64,
-    /// Deprecated and ignored as of 4.1.0 — routing now uses proportional
-    /// weighting. Retained only to warn operators whose config still sets it.
-    pub explore_ratio: Option<f64>,
     /// Error-rate EWMA above which a session-affinity pin is broken.
     /// Routing weights never consult it.
     pub error_threshold: f64,
-    /// Deprecated and ignored as of 4.2.0 — the success-rate EWMA recovers
-    /// through probe traffic rather than a time window.
-    pub error_decay_secs: Option<u64>,
     pub connect_timeout_secs: u64,
     pub read_timeout_secs: u64,
     /// Maximum request body size in bytes; larger requests 413.
@@ -172,8 +166,6 @@ pub struct RoutingConfig {
     /// half the container's cgroup memory limit when one is detected,
     /// else `4 * max_body_bytes`.
     pub max_buffered_bytes: Option<usize>,
-    /// Deprecated and ignored as of 4.2.0 — there is no error window to cap.
-    pub max_error_window_entries: Option<usize>,
     pub shutdown_timeout_secs: u64,
 }
 
@@ -182,14 +174,11 @@ impl Default for RoutingConfig {
         Self {
             ewma_alpha: 0.3,
             exploit_k: crate::router::EXPLOIT_K,
-            explore_ratio: None,
             error_threshold: 0.5,
-            error_decay_secs: None,
             connect_timeout_secs: 10,
             read_timeout_secs: 60,
             max_body_bytes: 32 * 1024 * 1024, // 32 MB
             max_buffered_bytes: None,
-            max_error_window_entries: None,
             shutdown_timeout_secs: 30,
         }
     }
@@ -246,21 +235,6 @@ impl Config {
             shellexpand::env(&raw).map_err(|e| anyhow::anyhow!("env var expansion failed: {e}"))?;
         let config: Config = toml::from_str(&interpolated)?;
         config.validate()?;
-        if config.routing.explore_ratio.is_some() {
-            tracing::warn!(
-                "`routing.explore_ratio` is deprecated and ignored as of 4.1.0; routing now uses proportional latency weighting"
-            );
-        }
-        if config.routing.error_decay_secs.is_some() {
-            tracing::warn!(
-                "`routing.error_decay_secs` is deprecated and ignored as of 4.2.0; errors now proportionally reduce a candidate's routing weight"
-            );
-        }
-        if config.routing.max_error_window_entries.is_some() {
-            tracing::warn!(
-                "`routing.max_error_window_entries` is deprecated and ignored as of 4.2.0; errors now proportionally reduce a candidate's routing weight"
-            );
-        }
         Ok(config)
     }
 

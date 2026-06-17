@@ -111,26 +111,6 @@ exploit_k = -1.0
 }
 
 #[test]
-fn deprecated_explore_ratio_is_accepted_and_ignored() {
-    let toml_str = r#"
-[provider.openai]
-base_url = "https://api.openai.com/v1"
-api_key = "sk-test"
-
-[model]
-fast = [{ provider = "openai", model = "gpt-4o-mini" }]
-
-[routing]
-explore_ratio = 0.02
-"#;
-    let config: Config = toml::from_str(toml_str).unwrap();
-    // Parses, validates, and is captured so load() can warn — but does not
-    // affect routing (which uses exploit_k).
-    assert!(config.validate().is_ok());
-    assert_eq!(config.routing.explore_ratio, Some(0.02));
-}
-
-#[test]
 fn timeout_explicit_values_override_defaults() {
     let toml_str = r#"
 [provider.openai]

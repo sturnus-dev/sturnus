@@ -13,8 +13,8 @@ their history lives in the git log and tags.
 
 Project renamed from `llmrouter` to `sturnus`. This is a breaking release: the
 binary, crate, container image, Prometheus metric names, response header, and
-environment variables all change name. Functionality is otherwise unchanged from
-4.3.0.
+environment variables all change name, and the routing config fields deprecated
+since 4.1/4.2 are removed.
 
 ### Changed (breaking)
 
@@ -28,10 +28,19 @@ environment variables all change name. Functionality is otherwise unchanged from
 - **Binary, crate, and container image renamed** to `sturnus`; the image is published
   to `ghcr.io/sturnus-dev/sturnus` and releases to `github.com/sturnus-dev/sturnus`.
 
+### Removed
+
+- **Deprecated `routing` fields dropped**: `explore_ratio` (no-op since 4.1.0),
+  `error_decay_secs` and `max_error_window_entries` (no-ops since 4.2.0). They were
+  already ignored; a config that still sets them now loads with the keys ignored
+  rather than logging a deprecation warning.
+
 ### Migration
 
 - Rename the metric prefix in any Grafana/Prometheus dashboards and alert rules
   (`llmrouter_` → `sturnus_`).
 - Replace reads of `x-llmrouter-provider` with `x-sturnus-provider`.
 - Update the binary/image name and any `LLMROUTER_LOG_FORMAT` env var.
-- Config file format is unchanged; existing `config.toml` files work as-is.
+- Existing `config.toml` files still load. The removed `routing` fields
+  (`explore_ratio`, `error_decay_secs`, `max_error_window_entries`) are now silently
+  ignored; delete them to keep configs tidy.
