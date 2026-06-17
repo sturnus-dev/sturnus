@@ -20,14 +20,14 @@ docker run -v ./config.toml:/config.toml \
   ghcr.io/sturnus-dev/sturnus:latest
 ```
 
-**Pre-built binary** — best for CI, scripting, or running without Docker:
+**`cargo install`** — best for local testing if you have a Rust toolchain:
 
 ```bash
-# Linux (x86_64) — also available for aarch64-unknown-linux-musl, x86_64-apple-darwin, aarch64-apple-darwin
-curl -fsSL https://github.com/sturnus-dev/sturnus/releases/latest/download/sturnus-x86_64-unknown-linux-musl -o sturnus
-chmod +x sturnus
-./sturnus --config config.toml
+cargo install sturnus
+sturnus --config config.toml
 ```
+
+Prebuilt static binaries for Linux and macOS (x86_64 and aarch64) are attached to every [release](https://github.com/sturnus-dev/sturnus/releases/latest).
 
 Then point any OpenAI-compatible SDK at sturnus — the only change is the base URL:
 
