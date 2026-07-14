@@ -9,6 +9,24 @@ rename it.
 Releases up to and including 4.3.0 were published under the `llmrouter` name;
 their history lives in the git log and tags.
 
+## [5.2.0] - 2026-07-14
+
+### Added
+
+- **Optional separate metrics listener** via a new `metrics_listen` config key.
+  When set (e.g. `metrics_listen = "0.0.0.0:4040"`), the observability endpoints
+  (`/metrics`, `/health`, `/healthz`, `/status`) are served on a second socket
+  that never exposes the proxy, so `listen` can bind loopback for the
+  credential-bearing proxy while Prometheus still scrapes metrics off a routable
+  address. On shutdown this listener stays up until the proxy has finished
+  draining, so the final scrape window isn't lost.
+
+## [5.1.0] - 2026-07-14
+
+### Added
+
+- **healthcheck subcommand** added to support exec probe healthchecks.
+
 ## [5.0.0] - 2026-06-17
 
 Project renamed from `llmrouter` to `sturnus`. This is a breaking release: the

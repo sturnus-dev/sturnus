@@ -1,4 +1,8 @@
-listen = "0.0.0.0:4000"  # use 127.0.0.1:4000 if running locally rather than in a container
+listen = "127.0.0.1:4000"
+
+# Optional second listener serving only /metrics, /health, /healthz, /status.
+# Bind to a routable address so Prometheus can scrape while the proxy stays on loopback.
+# metrics_listen = "0.0.0.0:4040"
 
 # Providers: where to send requests
 

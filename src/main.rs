@@ -1,6 +1,5 @@
 use clap::Parser;
 use std::io::IsTerminal;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -212,9 +211,18 @@ async fn main() -> anyhow::Result<()> {
         shutting_down: AtomicBool::new(false),
     });
 
-    let addr: SocketAddr = config.listen.parse()?;
+    let (addr, metrics_addr) = config.listen_addrs()?;
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "listening");
+
+    let metrics_listener = match metrics_addr {
+        Some(maddr) => {
+            let l = TcpListener::bind(maddr).await?;
+            info!(addr = %maddr, "serving observability endpoints on a separate listener");
+            Some(l)
+        }
+        None => None,
+    };
 
     let shutdown = async {
         use tokio::signal::unix::{signal, SignalKind};
@@ -228,7 +236,14 @@ async fn main() -> anyhow::Result<()> {
         info!("received shutdown signal");
     };
 
-    sturnus::server::run_server(listener, state, shutdown, shutdown_timeout).await;
+    sturnus::server::run_servers(
+        listener,
+        metrics_listener,
+        state,
+        shutdown,
+        shutdown_timeout,
+    )
+    .await;
 
     info!("server stopped");
     Ok(())

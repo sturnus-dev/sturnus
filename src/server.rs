@@ -100,40 +100,9 @@ pub async fn handle_request(
 
     debug!(%method, %path, "incoming request");
 
-    // GET endpoints
     if method == hyper::Method::GET {
-        if path == "/health" || path == "/healthz" {
-            if state.shutting_down.load(Ordering::Relaxed) {
-                let body = Bytes::from(r#"{"status":"shutting_down"}"#);
-                return Ok(json_response(hyper::StatusCode::SERVICE_UNAVAILABLE, body));
-            }
-            let body = Bytes::from(r#"{"status":"ok"}"#);
-            return Ok(json_response(hyper::StatusCode::OK, body));
-        }
-        if path == "/status" {
-            return Ok(build_status_response(&state));
-        }
-        if path == "/metrics" {
-            return match state.metrics.encode() {
-                Ok(buf) => {
-                    let body = Bytes::from(buf);
-                    let mut resp = Response::new(http_body_util::Either::Left(
-                        http_body_util::Full::new(body),
-                    ));
-                    resp.headers_mut().insert(
-                        CONTENT_TYPE,
-                        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-                    );
-                    Ok(resp)
-                }
-                Err(e) => {
-                    error!(error = %e, "failed to encode metrics");
-                    Ok(json_error(
-                        hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                        "failed to encode metrics",
-                    ))
-                }
-            };
+        if let Some(resp) = observability_get(&path, &state) {
+            return Ok(resp);
         }
         return Ok(json_error(hyper::StatusCode::NOT_FOUND, "not found"));
     }
@@ -412,9 +381,126 @@ fn json_response(status: hyper::StatusCode, body: Bytes) -> Response<BoxBody> {
     resp
 }
 
+/// Observability GETs shared by every listener; `None` = not an observability path.
+fn observability_get(path: &str, state: &AppState) -> Option<Response<BoxBody>> {
+    match path {
+        "/health" | "/healthz" => {
+            if state.shutting_down.load(Ordering::Relaxed) {
+                let body = Bytes::from(r#"{"status":"shutting_down"}"#);
+                Some(json_response(hyper::StatusCode::SERVICE_UNAVAILABLE, body))
+            } else {
+                let body = Bytes::from(r#"{"status":"ok"}"#);
+                Some(json_response(hyper::StatusCode::OK, body))
+            }
+        }
+        "/status" => Some(build_status_response(state)),
+        "/metrics" => Some(encode_metrics_response(state)),
+        _ => None,
+    }
+}
+
+fn encode_metrics_response(state: &AppState) -> Response<BoxBody> {
+    match state.metrics.encode() {
+        Ok(buf) => {
+            let body = Bytes::from(buf);
+            let mut resp = Response::new(http_body_util::Either::Left(http_body_util::Full::new(
+                body,
+            )));
+            resp.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+            );
+            resp
+        }
+        Err(e) => {
+            error!(error = %e, "failed to encode metrics");
+            json_error(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode metrics",
+            )
+        }
+    }
+}
+
+/// Metrics-listener handler: observability GETs only; never proxies.
+pub async fn handle_observability_request(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<BoxBody>, Infallible> {
+    if req.method() == hyper::Method::GET {
+        if let Some(resp) = observability_get(req.uri().path(), &state) {
+            return Ok(resp);
+        }
+    }
+    Ok(json_error(hyper::StatusCode::NOT_FOUND, "not found"))
+}
+
+/// Which surface a listener serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerRole {
+    /// Full router: the proxy plus the observability endpoints.
+    Full,
+    /// Observability only (`/metrics`, `/health`, `/status`); never proxies.
+    Observability,
+}
+
 pub async fn run_server(
     listener: TcpListener,
     state: Arc<AppState>,
+    shutdown: impl Future<Output = ()>,
+    shutdown_timeout: Duration,
+) {
+    run_server_with_role(
+        listener,
+        state,
+        ServerRole::Full,
+        shutdown,
+        shutdown_timeout,
+    )
+    .await;
+}
+
+/// Run the proxy and optional observability listener. Observability is
+/// stopped only after the proxy has drained, so scrapes survive the drain.
+pub async fn run_servers(
+    listener: TcpListener,
+    metrics_listener: Option<TcpListener>,
+    state: Arc<AppState>,
+    shutdown: impl Future<Output = ()>,
+    shutdown_timeout: Duration,
+) {
+    let Some(metrics_listener) = metrics_listener else {
+        return run_server(listener, state, shutdown, shutdown_timeout).await;
+    };
+
+    let (obs_tx, obs_rx) = tokio::sync::oneshot::channel::<()>();
+    let observability = tokio::spawn(run_server_with_role(
+        metrics_listener,
+        state.clone(),
+        ServerRole::Observability,
+        async move {
+            let _ = obs_rx.await;
+        },
+        shutdown_timeout,
+    ));
+
+    run_server_with_role(
+        listener,
+        state,
+        ServerRole::Full,
+        shutdown,
+        shutdown_timeout,
+    )
+    .await;
+
+    let _ = obs_tx.send(());
+    let _ = observability.await;
+}
+
+pub async fn run_server_with_role(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    role: ServerRole,
     shutdown: impl Future<Output = ()>,
     shutdown_timeout: Duration,
 ) {
@@ -437,8 +523,15 @@ pub async fn run_server(
                 let conn = http1::Builder::new()
                     .serve_connection(io, service_fn(move |req| {
                         let state = state.clone();
-                        let span = crate::trace::request_span(req.headers());
-                        handle_request(req, state).instrument(span)
+                        async move {
+                            let span = crate::trace::request_span(req.headers());
+                            match role {
+                                ServerRole::Full => handle_request(req, state).instrument(span).await,
+                                ServerRole::Observability => {
+                                    handle_observability_request(req, state).instrument(span).await
+                                }
+                            }
+                        }
                     }));
 
                 let conn = graceful.watch(conn);
