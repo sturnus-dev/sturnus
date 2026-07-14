@@ -25,6 +25,9 @@ enum LogFormat {
 #[derive(Parser)]
 #[command(name = "sturnus", about = "Lightweight LLM load-balancing sidecar")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to config TOML file
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
@@ -40,6 +43,17 @@ struct Cli {
     /// Log output format
     #[arg(long, value_enum, default_value = "auto", env = "STURNUS_LOG_FORMAT")]
     log_format: LogFormat,
+}
+
+/// Absent = run the router (default).
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Probe a running instance's /health and exit non-zero if unhealthy.
+    Healthcheck {
+        /// Router port to probe on localhost.
+        #[arg(long, default_value_t = 4000)]
+        port: u16,
+    },
 }
 
 // startup banner, shown only on an interactive terminal so it stays out of structured logs.
@@ -82,12 +96,30 @@ fn init_logging(format: LogFormat) {
     }
 }
 
+async fn run_healthcheck(port: u16) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let status = client.get(&url).send().await?.status();
+    if !status.is_success() {
+        anyhow::bail!("health probe {url} returned {status}");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.log_format);
-    print_banner();
     sturnus::init_crypto();
+
+    if let Some(Command::Healthcheck { port }) = &cli.command {
+        return run_healthcheck(*port).await;
+    }
+
+    print_banner();
 
     if let Some(ref env_path) = cli.env_file {
         sturnus::config::Config::load_env_file(env_path)?;
