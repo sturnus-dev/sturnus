@@ -234,6 +234,52 @@ async fn metrics_endpoint_returns_prometheus_text() {
 }
 
 #[tokio::test]
+async fn observability_listener_serves_metrics_but_never_proxies() {
+    use sturnus::server::{run_server_with_role, ServerRole};
+
+    let state = test_state();
+    state
+        .metrics
+        .requests_total
+        .with_label_values(&["fast", "test", "test-model", "200"])
+        .inc();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (_tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(run_server_with_role(
+        listener,
+        state.clone(),
+        ServerRole::Observability,
+        async {
+            let _ = rx.await;
+        },
+        Duration::from_secs(1),
+    ));
+
+    let health = reqwest::get(format!("http://{addr}/health")).await.unwrap();
+    assert_eq!(health.status(), 200);
+    let metrics = reqwest::get(format!("http://{addr}/metrics"))
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), 200);
+    assert!(metrics
+        .text()
+        .await
+        .unwrap()
+        .contains("sturnus_requests_total"));
+
+    // A POST the full server would proxy must 404 here, nothing sent upstream.
+    let proxied = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .json(&serde_json::json!({"model": "fast", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(proxied.status(), 404);
+}
+
+#[tokio::test]
 async fn shutdown_signal_stops_accept_loop() {
     let state = test_state();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -380,6 +426,71 @@ async fn graceful_drain_waits_for_inflight_request() {
         .await
         .expect("server did not shut down after drain")
         .expect("server task panicked");
+
+    mock_handle.abort();
+}
+
+#[tokio::test]
+async fn observability_listener_stays_up_while_proxy_drains() {
+    use sturnus::server::run_servers;
+
+    let (mock_port, upstream_tx, upstream_ready, mock_handle) = slow_upstream().await;
+    let state = test_state_with_upstream(mock_port);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let obs_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let obs_addr = obs_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let mut server_handle = tokio::spawn(run_servers(
+        proxy_listener,
+        Some(obs_listener),
+        state,
+        async {
+            let _ = shutdown_rx.await;
+        },
+        Duration::from_secs(5),
+    ));
+
+    let client_handle = proxy_request(proxy_addr);
+    upstream_ready.await.unwrap();
+
+    shutdown_tx.send(()).unwrap();
+
+    // Server should still be draining
+    let poll = tokio::time::timeout(Duration::from_millis(500), &mut server_handle).await;
+    assert!(
+        poll.is_err(),
+        "server exited while request was still in flight"
+    );
+
+    // Observability still serves during the drain
+    let metrics = reqwest::get(format!("http://{obs_addr}/metrics"))
+        .await
+        .unwrap();
+    assert_eq!(metrics.status(), 200);
+    let health = reqwest::get(format!("http://{obs_addr}/health"))
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 503);
+
+    // Release the upstream; drain completes, then observability stops
+    upstream_tx.send(()).unwrap();
+    let resp = client_handle.await.unwrap().unwrap();
+    assert_eq!(resp.status(), 200);
+
+    tokio::time::timeout(Duration::from_secs(2), server_handle)
+        .await
+        .expect("server did not shut down after drain")
+        .expect("server task panicked");
+
+    assert!(
+        reqwest::get(format!("http://{obs_addr}/metrics"))
+            .await
+            .is_err(),
+        "observability listener still accepting after shutdown"
+    );
 
     mock_handle.abort();
 }
