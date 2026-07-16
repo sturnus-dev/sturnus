@@ -312,6 +312,77 @@ fn cgroup_prefers_v2_over_v1() {
     assert_eq!(cgroup_memory_limit_from(&v2, &v1), Some(999));
 }
 
+#[test]
+fn metrics_listen_defaults_to_none() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.metrics_listen.is_none());
+    let (main, metrics) = config.listen_addrs().unwrap();
+    assert_eq!(main.to_string(), "127.0.0.1:4000");
+    assert!(metrics.is_none());
+}
+
+#[test]
+fn metrics_listen_parses_distinct_address() {
+    let toml_str = r#"
+listen = "127.0.0.1:4000"
+metrics_listen = "0.0.0.0:4040"
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.validate().is_ok());
+    let (main, metrics) = config.listen_addrs().unwrap();
+    assert_eq!(main.to_string(), "127.0.0.1:4000");
+    assert_eq!(metrics.unwrap().to_string(), "0.0.0.0:4040");
+}
+
+#[test]
+fn metrics_listen_equal_to_listen_is_rejected() {
+    let toml_str = r#"
+listen = "0.0.0.0:4000"
+metrics_listen = "0.0.0.0:4000"
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.listen_addrs().is_err());
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn invalid_metrics_listen_address_is_rejected() {
+    let toml_str = r#"
+metrics_listen = "not-an-address"
+
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+
+[model]
+fast = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(config.validate().is_err());
+}
+
 mod env_dir {
     use super::*;
     use std::io::Write;

@@ -83,8 +83,11 @@ sturnus has a bounded scope by design and has some deliberate omissions:
 ## Configuration
 
 ```toml
-# use 127.0.0.1:4000 if running locally rather than in a container
-listen = "0.0.0.0:4000"
+listen = "127.0.0.1:4000"
+
+# Optional: a second listener serving /metrics, /health, /healthz, /status
+# Bind it to a routable address so Prometheus can scrape it.
+# metrics_listen = "0.0.0.0:4040"
 
 # Providers: where to send requests
 [provider.openai]
@@ -144,6 +147,8 @@ Sidecar keys take precedence over any client-supplied `labels` keys with the sam
 | GET | `/status` | Returns current streaming/non-streaming EWMAs, error rate, and status per candidate |
 | GET | `/metrics` | Prometheus metrics (see below) |
 
+The `POST` proxy routes are served only on `listen`. The `GET` observability routes are served on `listen` and, when configured, on `metrics_listen`.
+
 ## Observability
 
 ### Metrics
@@ -199,7 +204,10 @@ The best provider is exploited heavily while worse ones keep enough traffic to s
 
 ## Docker
 
-When running in Docker or as a Kubernetes sidecar, `listen` must be `0.0.0.0:4000` (the value in `config.example.toml`) — `127.0.0.1` only accepts connections from within the container itself.
+`listen` carries the proxy and its provider credentials, so bind it as narrowly as the deployment allows:
+
+- **Kubernetes native sidecar** (recommended): the app container shares the pod's network namespace and reaches sturnus on `127.0.0.1:4000`, so keep `listen = "127.0.0.1:4000"` — bound to loopback, the credential-bearing proxy is unreachable from other pods entirely. To scrape metrics, set `metrics_listen = "0.0.0.0:4040"`: it serves only `/metrics`, `/health`, `/healthz` and `/status` (never the proxy) on the routable pod IP, and stays up until the proxy has finished draining so the final scrape window isn't lost. Containers in a pod share ports, so pick a metrics port the app doesn't use.
+- **Standalone Docker** with the client in a *separate* container: it reaches sturnus over the container's IP, which a `127.0.0.1` bind refuses, so `listen` must be `0.0.0.0:4000`.
 
 On Kubernetes, run sturnus as a [native sidecar](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/) — an init container with `restartPolicy: Always` (stable since v1.29). It then starts before the app container and is terminated after it, so the proxy is ready for the app's first request and stays up while the app drains.
 

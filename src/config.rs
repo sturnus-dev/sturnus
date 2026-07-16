@@ -1,12 +1,16 @@
 use crate::model_map::ProviderKind;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Optional second listen address that serves observability
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
     pub provider: HashMap<String, ProviderConfig>,
     pub model: HashMap<String, Vec<ModelCandidate>>,
     #[serde(default)]
@@ -266,7 +270,30 @@ impl Config {
         Ok(())
     }
 
+    /// Parse listen addresses; `metrics_listen` must differ from `listen`
+    /// (equal would re-expose the proxy).
+    pub fn listen_addrs(&self) -> anyhow::Result<(SocketAddr, Option<SocketAddr>)> {
+        let main = self
+            .listen
+            .parse::<SocketAddr>()
+            .map_err(|e| anyhow::anyhow!("invalid listen address '{}': {e}", self.listen))?;
+        let metrics = match &self.metrics_listen {
+            Some(ml) => {
+                let addr = ml
+                    .parse::<SocketAddr>()
+                    .map_err(|e| anyhow::anyhow!("invalid metrics_listen address '{ml}': {e}"))?;
+                if addr == main {
+                    anyhow::bail!("metrics_listen ({addr}) must differ from listen ({main})");
+                }
+                Some(addr)
+            }
+            None => None,
+        };
+        Ok((main, metrics))
+    }
+
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.listen_addrs()?;
         if !(0.0..=1.0).contains(&self.routing.ewma_alpha) {
             anyhow::bail!(
                 "ewma_alpha must be between 0.0 and 1.0, got {}",
