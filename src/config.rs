@@ -86,11 +86,12 @@ impl ProviderConfig {
     pub fn resolved_base_url(&self) -> Option<String> {
         self.base_url.clone().or_else(|| {
             if let Some(ref v) = self.vertex_ai {
-                // `global` has no regional hostname prefix.
-                let host = if v.location == "global" {
-                    "aiplatform.googleapis.com".to_string()
-                } else {
-                    format!("{}-aiplatform.googleapis.com", v.location)
+                let host = match v.location.as_str() {
+                    // `global` has no regional hostname prefix.
+                    "global" => "aiplatform.googleapis.com".to_string(),
+                    // Multi-regions are served by Representative Endpoint hosts.
+                    loc @ ("us" | "eu") => format!("aiplatform.{loc}.rep.googleapis.com"),
+                    loc => format!("{loc}-aiplatform.googleapis.com"),
                 };
                 return Some(format!(
                     "https://{}/v1beta1/projects/{}/locations/{}/endpoints/openapi",

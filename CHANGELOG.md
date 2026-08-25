@@ -9,6 +9,16 @@ rename it.
 Releases up to and including 4.3.0 were published under the `llmrouter` name;
 their history lives in the git log and tags.
 
+## [5.2.1] - 2026-08-25
+
+### Fixed
+
+- **Vertex AI multi-region locations** now resolve to their Representative
+  Endpoint hosts (`aiplatform.us.rep.googleapis.com`,
+  `aiplatform.eu.rep.googleapis.com`). Previously `location = "us"` or `"eu"`
+  built a regional hostname that returns `400 Invalid hostname`, so reaching a
+  multi-region required an explicit `base_url` override.
+
 ## [5.2.0] - 2026-07-14
 
 ### Added
