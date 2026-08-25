@@ -303,6 +303,87 @@ test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
 }
 
 #[test]
+fn headers_parse_into_outbound_map() {
+    let toml_str = r#"
+[provider.vertex-pt]
+vertex_ai = { project_id = "p", location = "eu" }
+headers = { "X-Vertex-AI-LLM-Request-Type" = "dedicated" }
+
+[model]
+test = [{ provider = "vertex-pt", model = "google/gemini-3.5-flash-lite" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    config.validate().unwrap();
+    let headers = config.provider["vertex-pt"].resolved_headers().unwrap();
+    assert_eq!(headers["x-vertex-ai-llm-request-type"], "dedicated");
+}
+
+#[test]
+fn headers_absent_resolves_empty() {
+    let toml_str = r#"
+[provider.openai]
+base_url = "https://api.openai.com/v1"
+api_key = "k"
+
+[model]
+test = [{ provider = "openai", model = "gpt-4o-mini" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    config.validate().unwrap();
+    assert!(config.provider["openai"]
+        .resolved_headers()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn rejects_headers_sturnus_sets_itself() {
+    for name in [
+        "Authorization",
+        "content-type",
+        "api-key",
+        "x-api-key",
+        "anthropic-version",
+        "Content-Length",
+        "transfer-encoding",
+    ] {
+        let toml_str = format!(
+            r#"
+[provider.p]
+base_url = "https://example.com/v1"
+headers = {{ "{name}" = "x" }}
+
+[model]
+test = [{{ provider = "p", model = "m" }}]
+"#
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert!(
+            config.validate().is_err(),
+            "'{name}' is set by sturnus and must be rejected"
+        );
+    }
+}
+
+#[test]
+fn rejects_malformed_header_name_or_value() {
+    for headers in [r#"{ "bad name" = "x" }"#, r#"{ good = "bad\nvalue" }"#] {
+        let toml_str = format!(
+            r#"
+[provider.p]
+base_url = "https://example.com/v1"
+headers = {headers}
+
+[model]
+test = [{{ provider = "p", model = "m" }}]
+"#
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        assert!(config.validate().is_err(), "should reject: {headers}");
+    }
+}
+
+#[test]
 fn attribution_field_does_not_exist_on_non_vertex_providers() {
     // `attribution` lives inside the vertex_ai shorthand, so non-Vertex
     // providers can't set it — the type system enforces Vertex-only.

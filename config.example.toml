@@ -25,6 +25,9 @@ vertex_ai = { project_id = "my-gcp-project", location = "us-central1" }
 # [provider.vertex-eu]
 # vertex_ai = { project_id = "my-gcp-project", location = "eu" }
 
+# Any provider takes extra headers, sent on every request to it
+# headers = { "X-Vertex-AI-LLM-Request-Type" = "dedicated" }
+
 # Vertex AI with API key (uses Bearer auth instead of GCP metadata server)
 # [provider.vertex-key]
 # api_key = "${VERTEX_API_KEY}"

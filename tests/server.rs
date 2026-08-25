@@ -23,9 +23,9 @@ fn test_state_with_upstream(upstream_port: u16) -> Arc<AppState> {
 }
 
 fn test_state_with_budget(upstream_port: u16, budget_kb: usize) -> Arc<AppState> {
-    sturnus::init_crypto();
-    let config: sturnus::config::Config = toml::from_str(&format!(
-        r#"
+    state_from_config(
+        &format!(
+            r#"
 [provider.test]
 base_url = "http://127.0.0.1:{upstream_port}"
 api_key = "fake"
@@ -33,8 +33,14 @@ api_key = "fake"
 [model]
 fast = [{{ provider = "test", model = "test-model" }}]
 "#,
-    ))
-    .unwrap();
+        ),
+        budget_kb,
+    )
+}
+
+fn state_from_config(config_toml: &str, budget_kb: usize) -> Arc<AppState> {
+    sturnus::init_crypto();
+    let config: sturnus::config::Config = toml::from_str(config_toml).unwrap();
 
     let mut tracker = Tracker::new(0.3, 0.5);
     let model_map = ModelMap::from_config(&config, &mut tracker).unwrap();
@@ -934,6 +940,59 @@ async fn outbound_request_carries_content_length() {
     assert!(
         !head.contains("transfer-encoding: chunked"),
         "outbound request must not be chunked:\n{head}"
+    );
+
+    mock_handle.abort();
+}
+
+#[tokio::test]
+async fn provider_headers_reach_upstream_and_client_headers_do_not() {
+    let (mock_port, head_rx, mock_handle) = capturing_upstream().await;
+    let state = state_from_config(
+        &format!(
+            r#"
+[provider.test]
+base_url = "http://127.0.0.1:{mock_port}"
+api_key = "fake"
+headers = {{ "X-Vertex-AI-LLM-Request-Type" = "dedicated" }}
+
+[model]
+fast = [{{ provider = "test", model = "test-model" }}]
+"#,
+        ),
+        128,
+    );
+    let (addr, _tx, _server) = start_server(state);
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/chat/completions"))
+        .header("x-vertex-ai-llm-request-type", "shared")
+        .header("x-client-smuggled", "1")
+        .json(&serde_json::json!({"model": "fast"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let head = tokio::time::timeout(Duration::from_secs(5), head_rx)
+        .await
+        .unwrap()
+        .unwrap()
+        .to_ascii_lowercase();
+
+    assert!(
+        head.contains("x-vertex-ai-llm-request-type: dedicated"),
+        "provider header must reach upstream:\n{head}"
+    );
+    assert!(
+        !head.contains("x-client-smuggled"),
+        "client headers must not reach upstream:\n{head}"
+    );
+    // A second value would let a caller override the provider's choice.
+    assert_eq!(
+        head.matches("x-vertex-ai-llm-request-type").count(),
+        1,
+        "provider header must appear exactly once:\n{head}"
     );
 
     mock_handle.abort();
