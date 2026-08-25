@@ -131,6 +131,12 @@ pub async fn forward_request(
         }
     }
 
+    if let Some(ref extra) = candidate.extra_headers {
+        req = extra
+            .iter()
+            .fold(req, |req, (name, value)| req.header(name, value));
+    }
+
     let t0 = Instant::now();
     // reqwest drops the streamed body once the upload completes, releasing
     // the buffer-budget permit it carries — no separate bookkeeping.

@@ -1,6 +1,6 @@
 use crate::config::{Config, ModelCandidate};
 use crate::tracker::Tracker;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderMap, HeaderValue};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -32,6 +32,10 @@ pub struct ResolvedCandidate {
     /// `None` unless this provider opted in. Shared across candidates
     /// since the contents are immutable after config load.
     pub attribution_labels: Option<Arc<BTreeMap<String, String>>>,
+    /// Extra headers set on every outbound request. `None` unless this
+    /// provider configured any. Shared across candidates since the contents
+    /// are immutable after config load.
+    pub extra_headers: Option<Arc<HeaderMap>>,
 }
 
 #[derive(Debug)]
@@ -54,6 +58,16 @@ impl ModelMap {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         );
+
+        let provider_headers: HashMap<&str, Arc<HeaderMap>> = config
+            .provider
+            .iter()
+            .map(|(name, p)| {
+                p.resolved_headers()
+                    .map(|headers| (name.as_str(), Arc::new(headers)))
+                    .map_err(|e| anyhow::anyhow!("provider '{name}': {e}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
 
         for (alias, candidates) in &config.model {
             let resolved = candidates
@@ -89,6 +103,10 @@ impl ModelMap {
                         .map(|v| v.attribution)
                         .unwrap_or(false)
                         .then(|| Arc::clone(&attribution_template));
+                    let extra_headers = provider_headers
+                        .get(c.provider.as_str())
+                        .filter(|headers| !headers.is_empty())
+                        .map(Arc::clone);
                     Ok(ResolvedCandidate {
                         provider_name: c.provider.clone(),
                         model: c.model.clone(),
@@ -99,6 +117,7 @@ impl ModelMap {
                         provider_header,
                         affinity_header,
                         attribution_labels,
+                        extra_headers,
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -202,6 +221,33 @@ test = [{ provider = "vertex", model = "google/gemini-2.5-flash" }]
         let mut tracker = Tracker::new(0.3, 0.5);
         let map = ModelMap::from_config(&config, &mut tracker).unwrap();
         assert!(map.get("test").unwrap()[0].attribution_labels.is_none());
+    }
+
+    #[test]
+    fn headers_propagate_only_to_configured_providers() {
+        let toml_str = r#"
+[provider.vertex-pt]
+vertex_ai = { project_id = "p", location = "eu" }
+headers = { "X-Vertex-AI-LLM-Request-Type" = "dedicated" }
+
+[provider.vertex-default]
+vertex_ai = { project_id = "p", location = "eu" }
+
+[model]
+pt      = [{ provider = "vertex-pt",      model = "google/gemini-3.5-flash-lite" }]
+default = [{ provider = "vertex-default", model = "google/gemini-3.5-flash-lite" }]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        config.validate().unwrap();
+        let mut tracker = Tracker::new(0.3, 0.5);
+        let map = ModelMap::from_config(&config, &mut tracker).unwrap();
+
+        let pt = map.get("pt").unwrap()[0]
+            .extra_headers
+            .as_ref()
+            .expect("configured provider should carry headers");
+        assert_eq!(pt["x-vertex-ai-llm-request-type"], "dedicated");
+        assert!(map.get("default").unwrap()[0].extra_headers.is_none());
     }
 
     #[test]

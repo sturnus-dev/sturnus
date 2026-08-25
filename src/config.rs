@@ -1,4 +1,5 @@
 use crate::model_map::ProviderKind;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -38,7 +39,21 @@ pub struct ProviderConfig {
     pub google_ai: Option<GoogleAiConfig>,
     /// Anthropic shorthand — derives base_url, uses x-api-key header.
     pub anthropic: Option<AnthropicConfig>,
+    /// Extra headers sent on every outbound request to this provider.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
+
+/// Headers sturnus sets itself, which a provider's `headers` map may not claim.
+const RESERVED_HEADERS: &[&str] = &[
+    "content-type",
+    "authorization",
+    "api-key",
+    "x-api-key",
+    "anthropic-version",
+    "content-length",
+    "transfer-encoding",
+];
 
 #[derive(Debug, Deserialize)]
 pub struct VertexAiConfig {
@@ -83,6 +98,24 @@ impl AnthropicConfig {
 }
 
 impl ProviderConfig {
+    /// Parse the configured `headers` ready for sending, rejecting malformed
+    /// names or values and any header sturnus sets itself.
+    pub fn resolved_headers(&self) -> anyhow::Result<HeaderMap> {
+        self.headers
+            .iter()
+            .map(|(name, value)| {
+                let name = HeaderName::try_from(name)
+                    .map_err(|_| anyhow::anyhow!("invalid header name '{name}'"))?;
+                if RESERVED_HEADERS.contains(&name.as_str()) {
+                    anyhow::bail!("header '{name}' is set by sturnus and cannot be overridden");
+                }
+                let value = HeaderValue::try_from(value)
+                    .map_err(|_| anyhow::anyhow!("invalid value for header '{name}'"))?;
+                Ok((name, value))
+            })
+            .collect()
+    }
+
     pub fn resolved_base_url(&self) -> Option<String> {
         self.base_url.clone().or_else(|| {
             if let Some(ref v) = self.vertex_ai {
@@ -342,6 +375,8 @@ impl Config {
                     base_url
                 );
             }
+            p.resolved_headers()
+                .map_err(|e| anyhow::anyhow!("provider '{name}': {e}"))?;
         }
         for (alias, candidates) in &self.model {
             for c in candidates {

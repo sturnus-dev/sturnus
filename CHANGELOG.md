@@ -9,6 +9,20 @@ rename it.
 Releases up to and including 4.3.0 were published under the `llmrouter` name;
 their history lives in the git log and tags.
 
+## [5.3.0] - 2026-08-25
+
+### Added
+
+- **Per-provider request headers** via a new `headers` map on any provider,
+  sent on every outbound request to it. This covers upstream options carried as
+  headers rather than body fields, such as pinning a Vertex provider to
+  provisioned throughput with `X-Vertex-AI-LLM-Request-Type`. Names and values
+  are parsed at config load, and anything sturnus sets itself (`authorization`,
+  `api-key`, `x-api-key`, `anthropic-version`, `content-type`) or that frames
+  the request (`content-length`, `transfer-encoding`) fails startup rather than
+  being silently dropped. Client-supplied headers are still never forwarded
+  upstream.
+
 ## [5.2.1] - 2026-08-25
 
 ### Fixed
