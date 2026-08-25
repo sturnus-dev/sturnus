@@ -32,10 +32,9 @@ pub struct ResolvedCandidate {
     /// `None` unless this provider opted in. Shared across candidates
     /// since the contents are immutable after config load.
     pub attribution_labels: Option<Arc<BTreeMap<String, String>>>,
-    /// Extra headers set on every outbound request. `None` unless this
-    /// provider configured any. Shared across candidates since the contents
-    /// are immutable after config load.
-    pub extra_headers: Option<Arc<HeaderMap>>,
+    /// Extra headers set on every outbound request. Shared across candidates
+    /// since the contents are immutable after config load.
+    pub extra_headers: Arc<HeaderMap>,
 }
 
 #[derive(Debug)]
@@ -60,14 +59,10 @@ impl ModelMap {
         );
 
         let provider_headers: HashMap<&str, Arc<HeaderMap>> = config
-            .provider
-            .iter()
-            .map(|(name, p)| {
-                p.resolved_headers()
-                    .map(|headers| (name.as_str(), Arc::new(headers)))
-                    .map_err(|e| anyhow::anyhow!("provider '{name}': {e}"))
-            })
-            .collect::<anyhow::Result<_>>()?;
+            .resolved_headers()?
+            .into_iter()
+            .map(|(name, headers)| (name, Arc::new(headers)))
+            .collect();
 
         for (alias, candidates) in &config.model {
             let resolved = candidates
@@ -105,8 +100,8 @@ impl ModelMap {
                         .then(|| Arc::clone(&attribution_template));
                     let extra_headers = provider_headers
                         .get(c.provider.as_str())
-                        .filter(|headers| !headers.is_empty())
-                        .map(Arc::clone);
+                        .map(Arc::clone)
+                        .unwrap_or_default();
                     Ok(ResolvedCandidate {
                         provider_name: c.provider.clone(),
                         model: c.model.clone(),
@@ -242,12 +237,9 @@ default = [{ provider = "vertex-default", model = "google/gemini-3.5-flash-lite"
         let mut tracker = Tracker::new(0.3, 0.5);
         let map = ModelMap::from_config(&config, &mut tracker).unwrap();
 
-        let pt = map.get("pt").unwrap()[0]
-            .extra_headers
-            .as_ref()
-            .expect("configured provider should carry headers");
+        let pt = &map.get("pt").unwrap()[0].extra_headers;
         assert_eq!(pt["x-vertex-ai-llm-request-type"], "dedicated");
-        assert!(map.get("default").unwrap()[0].extra_headers.is_none());
+        assert!(map.get("default").unwrap()[0].extra_headers.is_empty());
     }
 
     #[test]

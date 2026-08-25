@@ -44,17 +44,6 @@ pub struct ProviderConfig {
     pub headers: HashMap<String, String>,
 }
 
-/// Headers sturnus sets itself, which a provider's `headers` map may not claim.
-const RESERVED_HEADERS: &[&str] = &[
-    "content-type",
-    "authorization",
-    "api-key",
-    "x-api-key",
-    "anthropic-version",
-    "content-length",
-    "transfer-encoding",
-];
-
 #[derive(Debug, Deserialize)]
 pub struct VertexAiConfig {
     pub project_id: String,
@@ -97,23 +86,39 @@ impl AnthropicConfig {
     }
 }
 
+impl Config {
+    /// Parsed `headers` for every provider, keyed by provider name.
+    pub fn resolved_headers(&self) -> anyhow::Result<HashMap<&str, HeaderMap>> {
+        self.provider
+            .iter()
+            .map(|(name, p)| {
+                p.resolved_headers()
+                    .map(|headers| (name.as_str(), headers))
+                    .map_err(|e| anyhow::anyhow!("provider '{name}': {e}"))
+            })
+            .collect()
+    }
+}
+
 impl ProviderConfig {
-    /// Parse the configured `headers` ready for sending, rejecting malformed
-    /// names or values and any header sturnus sets itself.
+    /// Parse the configured `headers` ready for sending.
     pub fn resolved_headers(&self) -> anyhow::Result<HeaderMap> {
         self.headers
             .iter()
-            .map(|(name, value)| {
+            .try_fold(HeaderMap::new(), |mut map, (name, value)| {
                 let name = HeaderName::try_from(name)
                     .map_err(|_| anyhow::anyhow!("invalid header name '{name}'"))?;
-                if RESERVED_HEADERS.contains(&name.as_str()) {
-                    anyhow::bail!("header '{name}' is set by sturnus and cannot be overridden");
+                if crate::proxy::is_reserved_request_header(&name) {
+                    anyhow::bail!("header '{name}' is reserved by sturnus and cannot be set");
                 }
                 let value = HeaderValue::try_from(value)
                     .map_err(|_| anyhow::anyhow!("invalid value for header '{name}'"))?;
-                Ok((name, value))
+                // Case-distinct config keys are the same header.
+                if map.insert(&name, value).is_some() {
+                    anyhow::bail!("header '{name}' is set more than once");
+                }
+                Ok(map)
             })
-            .collect()
     }
 
     pub fn resolved_base_url(&self) -> Option<String> {
@@ -375,9 +380,8 @@ impl Config {
                     base_url
                 );
             }
-            p.resolved_headers()
-                .map_err(|e| anyhow::anyhow!("provider '{name}': {e}"))?;
         }
+        self.resolved_headers()?;
         for (alias, candidates) in &self.model {
             for c in candidates {
                 if !self.provider.contains_key(&c.provider) {

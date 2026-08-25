@@ -346,6 +346,16 @@ fn rejects_headers_sturnus_sets_itself() {
         "anthropic-version",
         "Content-Length",
         "transfer-encoding",
+        // Framing and routing.
+        "Host",
+        "content-encoding",
+        // Hop-by-hop.
+        "Connection",
+        "keep-alive",
+        "TE",
+        "trailer",
+        "upgrade",
+        "proxy-authorization",
     ] {
         let toml_str = format!(
             r#"
@@ -360,9 +370,26 @@ test = [{{ provider = "p", model = "m" }}]
         let config: Config = toml::from_str(&toml_str).unwrap();
         assert!(
             config.validate().is_err(),
-            "'{name}' is set by sturnus and must be rejected"
+            "'{name}' is reserved by sturnus and must be rejected"
         );
     }
+}
+
+#[test]
+fn rejects_header_names_colliding_on_case() {
+    let toml_str = r#"
+[provider.p]
+base_url = "https://example.com/v1"
+headers = { "X-Request-Type" = "dedicated", "x-request-type" = "shared" }
+
+[model]
+test = [{ provider = "p", model = "m" }]
+"#;
+    let config: Config = toml::from_str(toml_str).unwrap();
+    assert!(
+        config.validate().is_err(),
+        "case-variant keys are one header and must not both be sent"
+    );
 }
 
 #[test]
