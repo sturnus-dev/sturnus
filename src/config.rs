@@ -1,4 +1,5 @@
 use crate::model_map::ProviderKind;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -38,6 +39,9 @@ pub struct ProviderConfig {
     pub google_ai: Option<GoogleAiConfig>,
     /// Anthropic shorthand — derives base_url, uses x-api-key header.
     pub anthropic: Option<AnthropicConfig>,
+    /// Extra headers sent on every outbound request to this provider.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +86,41 @@ impl AnthropicConfig {
     }
 }
 
+impl Config {
+    /// Parsed `headers` for every provider, keyed by provider name.
+    pub fn resolved_headers(&self) -> anyhow::Result<HashMap<&str, HeaderMap>> {
+        self.provider
+            .iter()
+            .map(|(name, p)| {
+                p.resolved_headers()
+                    .map(|headers| (name.as_str(), headers))
+                    .map_err(|e| anyhow::anyhow!("provider '{name}': {e}"))
+            })
+            .collect()
+    }
+}
+
 impl ProviderConfig {
+    /// Parse the configured `headers` ready for sending.
+    pub fn resolved_headers(&self) -> anyhow::Result<HeaderMap> {
+        self.headers
+            .iter()
+            .try_fold(HeaderMap::new(), |mut map, (name, value)| {
+                let name = HeaderName::try_from(name)
+                    .map_err(|_| anyhow::anyhow!("invalid header name '{name}'"))?;
+                if crate::proxy::is_reserved_request_header(&name) {
+                    anyhow::bail!("header '{name}' is reserved by sturnus and cannot be set");
+                }
+                let value = HeaderValue::try_from(value)
+                    .map_err(|_| anyhow::anyhow!("invalid value for header '{name}'"))?;
+                // Case-distinct config keys are the same header.
+                if map.insert(&name, value).is_some() {
+                    anyhow::bail!("header '{name}' is set more than once");
+                }
+                Ok(map)
+            })
+    }
+
     pub fn resolved_base_url(&self) -> Option<String> {
         self.base_url.clone().or_else(|| {
             if let Some(ref v) = self.vertex_ai {
@@ -343,6 +381,7 @@ impl Config {
                 );
             }
         }
+        self.resolved_headers()?;
         for (alias, candidates) in &self.model {
             for c in candidates {
                 if !self.provider.contains_key(&c.provider) {

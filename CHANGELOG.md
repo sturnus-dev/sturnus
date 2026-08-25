@@ -9,6 +9,18 @@ rename it.
 Releases up to and including 4.3.0 were published under the `llmrouter` name;
 their history lives in the git log and tags.
 
+## [5.3.0] - 2026-08-25
+
+### Added
+
+- **Per-provider request headers** via a new `headers` map on any provider,
+  sent on every outbound request to it. This covers upstream options carried as
+  headers rather than body fields, such as pinning a Vertex provider to
+  provisioned throughput with `X-Vertex-AI-LLM-Request-Type`. Headers sturnus
+  sets itself, those framing or routing the request, and the hop-by-hop set fail
+  startup rather than being silently dropped, as do two keys differing only in
+  case.
+
 ## [5.2.1] - 2026-08-25
 
 ### Fixed
