@@ -35,6 +35,48 @@ fn vertex_ai_global_location_omits_region_prefix() {
 }
 
 #[test]
+fn vertex_ai_multi_region_uses_rep_host() {
+    for (location, host) in [
+        ("us", "aiplatform.us.rep.googleapis.com"),
+        ("eu", "aiplatform.eu.rep.googleapis.com"),
+    ] {
+        let provider = ProviderConfig {
+            vertex_ai: Some(VertexAiConfig {
+                project_id: "my-project".into(),
+                location: location.into(),
+                attribution: false,
+            }),
+            ..Default::default()
+        };
+        let url = provider.resolved_base_url().unwrap();
+        assert_eq!(
+            url,
+            format!(
+                "https://{host}/v1beta1/projects/my-project/locations/{location}/endpoints/openapi"
+            )
+        );
+    }
+}
+
+#[test]
+fn vertex_ai_explicit_base_url_overrides_shorthand() {
+    let provider = ProviderConfig {
+        base_url: Some("https://aiplatform.eu.rep.googleapis.com/v1beta1/custom".into()),
+        vertex_ai: Some(VertexAiConfig {
+            project_id: "my-project".into(),
+            location: "eu".into(),
+            attribution: false,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        provider.resolved_base_url().unwrap(),
+        "https://aiplatform.eu.rep.googleapis.com/v1beta1/custom"
+    );
+    assert_eq!(provider.resolved_kind(), ProviderKind::GcpAdc);
+}
+
+#[test]
 fn vertex_ai_defaults_to_gcp_adc_auth() {
     let provider = ProviderConfig {
         vertex_ai: Some(VertexAiConfig {
