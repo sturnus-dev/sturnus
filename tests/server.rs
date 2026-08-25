@@ -960,7 +960,7 @@ headers = {{ "X-Vertex-AI-LLM-Request-Type" = "dedicated" }}
 fast = [{{ provider = "test", model = "test-model" }}]
 "#,
         ),
-        128,
+        128 * 1024,
     );
     let (addr, _tx, _server) = start_server(state);
 
