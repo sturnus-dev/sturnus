@@ -119,6 +119,21 @@ sturnus --env-file /secrets/.env
 ```
 
 <details>
+<summary><b>Per-provider request headers</b></summary>
+
+Any provider takes a `headers` map, sent on every outbound request to it. Useful for upstream routing controls such as Vertex provisioned throughput:
+
+```toml
+[provider.vertex-pt]
+vertex_ai = { project_id = "my-project", location = "us-central1" }
+headers = { "X-Vertex-AI-LLM-Request-Type" = "dedicated" }
+```
+
+Headers are per provider, not per model alias, so pointing two aliases at the same provider gives both the same headers; use separate providers to vary them.
+
+</details>
+
+<details>
 <summary><b>Vertex billing attribution</b></summary>
 
 For Vertex providers, sturnus can inject sidecar-controlled `labels` into outbound requests so the resulting spend shows up tagged in GCP Billing Export. The labels live in a top-level `[attribution]` block (typically deployment identity sourced from env vars) and are merged into each request body for any Vertex provider that opts in:

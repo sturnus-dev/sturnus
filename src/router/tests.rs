@@ -15,6 +15,7 @@ fn make_candidate(provider: &str, model: &str, stats_index: usize) -> ResolvedCa
         affinity_header: hyper::header::HeaderValue::try_from(format!("{provider}/{model}"))
             .unwrap(),
         attribution_labels: None,
+        extra_headers: Default::default(),
     }
 }
 

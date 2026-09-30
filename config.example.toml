@@ -21,9 +21,11 @@ base_url = "http://localhost:8000/v1"
 [provider.vertex]
 vertex_ai = { project_id = "my-gcp-project", location = "us-central1" }
 
-# location also accepts "global" and the "us" / "eu" multi-regions
+# location also accepts "global" and the "us" / "eu" multi-regions.
+# Any provider takes extra headers, sent on every request to it.
 # [provider.vertex-eu]
 # vertex_ai = { project_id = "my-gcp-project", location = "eu" }
+# headers = { "X-Vertex-AI-LLM-Request-Type" = "dedicated" }
 
 # Vertex AI with API key (uses Bearer auth instead of GCP metadata server)
 # [provider.vertex-key]

@@ -2,6 +2,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{Full, StreamBody};
 use hyper::body::{Body, Frame, SizeHint};
+use reqwest::header::{self, HeaderName};
 use reqwest::Client;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -93,6 +94,41 @@ impl Body for OutboundBody {
     }
 }
 
+/// Hop-by-hop headers (RFC 9110 §7.6.1).
+const HOP_BY_HOP: &[HeaderName] = &[
+    header::CONNECTION,
+    header::PROXY_AUTHORIZATION,
+    header::TE,
+    header::TRAILER,
+    header::TRANSFER_ENCODING,
+    header::UPGRADE,
+];
+
+fn is_hop_by_hop(name: &HeaderName) -> bool {
+    // `keep-alive` has no constant in the http crate.
+    HOP_BY_HOP.contains(name) || name.as_str() == "keep-alive"
+}
+
+// No http crate constants exist for these.
+const API_KEY: &str = "api-key";
+const X_API_KEY: &str = "x-api-key";
+const ANTHROPIC_VERSION: &str = "anthropic-version";
+
+/// Headers `forward_request` sets, plus those framing or routing the request.
+const SET_BY_STURNUS: &[HeaderName] = &[
+    header::CONTENT_TYPE,
+    header::AUTHORIZATION,
+    header::CONTENT_ENCODING,
+    header::CONTENT_LENGTH,
+    header::HOST,
+];
+
+pub fn is_reserved_request_header(name: &HeaderName) -> bool {
+    is_hop_by_hop(name)
+        || SET_BY_STURNUS.contains(name)
+        || [API_KEY, X_API_KEY, ANTHROPIC_VERSION].contains(&name.as_str())
+}
+
 pub async fn forward_request(
     client: &Client,
     candidate: &ResolvedCandidate,
@@ -105,31 +141,38 @@ pub async fn forward_request(
     let url = build_upstream_url(candidate, path);
     debug!(url = %url, model = %candidate.model, provider = %candidate.provider_name, "forwarding request");
 
-    let mut req = client.post(&url).header("content-type", "application/json");
+    let mut req = client
+        .post(&url)
+        .header(header::CONTENT_TYPE, "application/json");
 
     match candidate.kind {
         ProviderKind::ApiKey => {
             if let Some(ref key) = candidate.api_key {
-                req = req.header("authorization", format!("Bearer {key}"));
+                req = req.header(header::AUTHORIZATION, format!("Bearer {key}"));
             }
         }
         ProviderKind::GcpAdc => {
             let provider = gcp_token_provider.ok_or("gcp auth requires GCP token provider")?;
             let token = provider.get_token().await?;
-            req = req.header("authorization", format!("Bearer {token}"));
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         ProviderKind::AzureOpenAi { .. } => {
             if let Some(ref key) = candidate.api_key {
-                req = req.header("api-key", key.as_str());
+                req = req.header(API_KEY, key.as_str());
             }
         }
         ProviderKind::Anthropic { ref version } => {
             if let Some(ref key) = candidate.api_key {
-                req = req.header("x-api-key", key.as_str());
+                req = req.header(X_API_KEY, key.as_str());
             }
-            req = req.header("anthropic-version", version.as_str());
+            req = req.header(ANTHROPIC_VERSION, version.as_str());
         }
     }
+
+    req = candidate
+        .extra_headers
+        .iter()
+        .fold(req, |req, (name, value)| req.header(name, value));
 
     let t0 = Instant::now();
     // reqwest drops the streamed body once the upload completes, releasing
@@ -284,23 +327,17 @@ where
     })
 }
 
-// Hop-by-hop (RFC 9110 §7.6.1) plus origin-scoped headers; everything else relays through.
-const STRIP_HEADERS: &[reqwest::header::HeaderName] = &[
-    reqwest::header::CONNECTION,
-    reqwest::header::TRANSFER_ENCODING,
-    reqwest::header::TE,
-    reqwest::header::TRAILER,
-    reqwest::header::UPGRADE,
-    reqwest::header::PROXY_AUTHENTICATE,
-    reqwest::header::PROXY_AUTHORIZATION,
-    reqwest::header::SET_COOKIE,
-    reqwest::header::ALT_SVC,
+/// Origin-scoped response headers; everything else relays through.
+const RESPONSE_ONLY_STRIP: &[HeaderName] = &[
+    header::PROXY_AUTHENTICATE,
+    header::SET_COOKIE,
+    header::ALT_SVC,
 ];
 
 fn sanitize_response_headers(upstream: &reqwest::header::HeaderMap) -> hyper::HeaderMap {
     let mut headers = hyper::HeaderMap::new();
     for (k, v) in upstream {
-        if STRIP_HEADERS.contains(k) || k.as_str().eq_ignore_ascii_case("keep-alive") {
+        if is_hop_by_hop(k) || RESPONSE_ONLY_STRIP.contains(k) {
             continue;
         }
         if let (Ok(name), Ok(val)) = (
