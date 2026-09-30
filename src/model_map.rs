@@ -32,9 +32,8 @@ pub struct ResolvedCandidate {
     /// `None` unless this provider opted in. Shared across candidates
     /// since the contents are immutable after config load.
     pub attribution_labels: Option<Arc<BTreeMap<String, String>>>,
-    /// Extra headers set on every outbound request. Shared across candidates
-    /// since the contents are immutable after config load.
-    pub extra_headers: Arc<HeaderMap>,
+    /// Extra headers set on every outbound request.
+    pub extra_headers: HeaderMap,
 }
 
 #[derive(Debug)]
@@ -57,12 +56,6 @@ impl ModelMap {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         );
-
-        let provider_headers: HashMap<&str, Arc<HeaderMap>> = config
-            .resolved_headers()?
-            .into_iter()
-            .map(|(name, headers)| (name, Arc::new(headers)))
-            .collect();
 
         for (alias, candidates) in &config.model {
             let resolved = candidates
@@ -98,10 +91,9 @@ impl ModelMap {
                         .map(|v| v.attribution)
                         .unwrap_or(false)
                         .then(|| Arc::clone(&attribution_template));
-                    let extra_headers = provider_headers
-                        .get(c.provider.as_str())
-                        .map(Arc::clone)
-                        .unwrap_or_default();
+                    let extra_headers = prov
+                        .resolved_headers()
+                        .map_err(|e| anyhow::anyhow!("provider '{}': {e}", c.provider))?;
                     Ok(ResolvedCandidate {
                         provider_name: c.provider.clone(),
                         model: c.model.clone(),
