@@ -65,6 +65,8 @@ impl CandidateStats {
 
     pub fn record_outcome(&self, success: bool, alpha: f64) {
         let sample = if success { 1.0 } else { 0.0 };
+        // Switch to `update` once MSRV reaches 1.95.
+        #[allow(deprecated)]
         let _ = self
             .success_rate
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -73,6 +75,8 @@ impl CandidateStats {
     }
 
     pub fn update_ewma(&self, mode: LatencyMode, observed_ms: u64, alpha: f64) {
+        // Switch to `update` once MSRV reaches 1.95.
+        #[allow(deprecated)]
         let _ = self
             .ewma_field(mode)
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
