@@ -11,6 +11,9 @@ jobs:
     with:
       build: true
 
+  macos:
+    uses: ./.github/workflows/macos-build.yml
+
   docker:
     runs-on: ubuntu-latest
     steps:
